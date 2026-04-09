@@ -1,4 +1,5 @@
 const admin = require("firebase-admin");
+const crypto = require("crypto");
 const express = require("express");
 const cors = require("cors");
 const Busboy = require("busboy");
@@ -93,6 +94,176 @@ function toNumber(value) {
 
 function round2(value) {
   return Math.round(toNumber(value) * 100) / 100;
+}
+
+function sanitizeFileName(value) {
+  return String(value || "")
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "");
+}
+
+function parseRemoteUrl(value) {
+  try {
+    const url = new URL(String(value || "").trim());
+
+    if (!["http:", "https:"].includes(url.protocol)) {
+      return null;
+    }
+
+    return url;
+  } catch (error) {
+    return null;
+  }
+}
+
+function getImageExtension(contentType, pathname) {
+  const normalizedType = String(contentType || "").toLowerCase().split(";")[0].trim();
+  const byContentType = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "image/svg+xml": "svg",
+    "image/bmp": "bmp",
+    "image/x-icon": "ico",
+    "image/vnd.microsoft.icon": "ico",
+    "image/avif": "avif",
+  };
+
+  if (byContentType[normalizedType]) {
+    return byContentType[normalizedType];
+  }
+
+  const match = String(pathname || "").toLowerCase().match(/\.([a-z0-9]{2,5})$/);
+  if (match) {
+    return match[1];
+  }
+
+  return "jpg";
+}
+
+function buildFirebaseDownloadUrl(bucketName, filePath, token) {
+  return `https://firebasestorage.googleapis.com/v0/b/${bucketName}/o/${encodeURIComponent(filePath)}?alt=media&token=${token}`;
+}
+
+async function fetchRemoteImage(sourceUrl) {
+  const url = parseRemoteUrl(sourceUrl);
+
+  if (!url) {
+    throw new Error("A URL da imagem informada nao e valida.");
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        "user-agent": "Mozilla/5.0 (compatible; DecoratieBot/1.0; +https://decoratie-38ba6.web.app)",
+        "accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "accept-language": "pt-BR,pt;q=0.9,en;q=0.8",
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`A origem retornou status ${response.status}.`);
+    }
+
+    const contentType = String(response.headers.get("content-type") || "").split(";")[0].trim();
+    if (!contentType.toLowerCase().startsWith("image/")) {
+      throw new Error("A URL informada nao retornou uma imagem valida.");
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    if (!buffer.length) {
+      throw new Error("A imagem retornada pela origem esta vazia.");
+    }
+
+    if (buffer.length > 10 * 1024 * 1024) {
+      throw new Error("A imagem excede o limite de 10 MB para importacao.");
+    }
+
+    return {
+      buffer,
+      contentType,
+      sourceUrl: url,
+    };
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error("Tempo limite excedido ao baixar a imagem remota.");
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchRemoteImageWithFallback(primaryUrl, fallbackUrl) {
+  const primary = parseRemoteUrl(primaryUrl);
+  const fallback = parseRemoteUrl(fallbackUrl);
+
+  if (!primary && !fallback) {
+    throw new Error("Nenhuma URL de imagem valida foi informada.");
+  }
+
+  const tried = new Set();
+
+  if (primary) {
+    tried.add(primary.toString());
+
+    try {
+      return await fetchRemoteImage(primary);
+    } catch (error) {
+      if (!fallback || tried.has(fallback.toString())) {
+        throw error;
+      }
+    }
+  }
+
+  return fetchRemoteImage(fallback);
+}
+
+async function importarImagemProduto({imageUrl, fallbackUrl, productId, productName}) {
+  const {buffer, contentType, sourceUrl} = await fetchRemoteImageWithFallback(
+      imageUrl,
+      fallbackUrl,
+  );
+  const baseName = sanitizeFileName(productName) || "produto";
+  const extension = getImageExtension(contentType, sourceUrl.pathname);
+  const folderName = sanitizeFileName(productId) || "manual";
+  const filePath = `public/products/${folderName}/${Date.now()}-${baseName}.${extension}`;
+  const token = crypto.randomUUID();
+  const bucket = admin.storage().bucket();
+  const file = bucket.file(filePath);
+
+  await file.save(buffer, {
+    resumable: false,
+    metadata: {
+      contentType,
+      cacheControl: "public, max-age=31536000, immutable",
+      metadata: {
+        firebaseStorageDownloadTokens: token,
+        originalSourceUrl: sourceUrl.toString(),
+      },
+    },
+  });
+
+  return {
+    path: filePath,
+    url: buildFirebaseDownloadUrl(bucket.name, filePath, token),
+    contentType,
+    sourceUrl: sourceUrl.toString(),
+  };
 }
 
 function parseXmlNFe(xmlContent) {
@@ -789,6 +960,57 @@ app.get("/api/importacoes/exportar-xlsx/:id", async (req, res) => {
     res.send(buffer);
   } catch (error) {
     res.status(error.statusCode || 500).json({erro: error.message || "Erro ao exportar XLSX"});
+  }
+});
+
+app.get("/api/produtos/baixar-imagem", async (req, res) => {
+  try {
+    const imageUrl = String(req.query.url || "");
+    const fallbackUrl = String(req.query.fallbackUrl || "");
+    const productName = String(req.query.productName || "imagem-produto");
+    const {buffer, contentType, sourceUrl} = await fetchRemoteImageWithFallback(
+        imageUrl,
+        fallbackUrl,
+    );
+    const extension = getImageExtension(contentType, sourceUrl.pathname);
+    const filename = `${sanitizeFileName(productName) || "imagem-produto"}.${extension}`;
+
+    res.setHeader("Content-Type", contentType);
+    res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${filename}"`,
+    );
+    return res.send(buffer);
+  } catch (error) {
+    return res.status(400).json({
+      erro: error.message || "Nao foi possivel baixar a imagem.",
+    });
+  }
+});
+
+app.post("/api/produtos/importar-imagem", async (req, res) => {
+  try {
+    const body = await obterBodyJson(req);
+    const imageUrl = String(body.imageUrl || "");
+    const fallbackUrl = String(body.fallbackUrl || "");
+    const productId = String(body.productId || "");
+    const productName = String(body.productName || "produto");
+
+    const importedImage = await importarImagemProduto({
+      imageUrl,
+      fallbackUrl,
+      productId,
+      productName,
+    });
+
+    return res.json({
+      sucesso: true,
+      ...importedImage,
+    });
+  } catch (error) {
+    return res.status(400).json({
+      erro: error.message || "Nao foi possivel importar a imagem do produto.",
+    });
   }
 });
 

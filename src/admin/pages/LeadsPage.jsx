@@ -1,5 +1,4 @@
 import { useDeferredValue, useMemo, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
 import { deleteDoc, doc, serverTimestamp, updateDoc } from 'firebase/firestore'
 import { db } from '../../lib/firebaseClient.js'
 import { formatDateTime, getDateValue, getInitials } from '../../shared/formatters.js'
@@ -56,7 +55,6 @@ function buildFileStamp() {
 }
 
 export default function LeadsPage() {
-  const navigate = useNavigate()
   const { data: leads, loading } = useCollectionData('leads')
   const { notify } = useAdminUI()
   const [search, setSearch] = useState('')

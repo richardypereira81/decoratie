@@ -15,6 +15,7 @@
   "dependencies": {
     "@react-three/drei": "^10.7.7",
     "@react-three/fiber": "^9.5.0",
+    "fast-xml-parser": "^5.5.11",
     "firebase": "^12.11.0",
     "framer-motion": "^12.38.0",
     "gsap": "^3.14.2",
@@ -22,7 +23,8 @@
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
     "react-router-dom": "^6.30.3",
-    "three": "^0.183.2"
+    "three": "^0.183.2",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@eslint/js": "^8.57.1",

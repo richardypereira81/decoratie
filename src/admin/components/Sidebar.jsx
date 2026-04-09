@@ -1,10 +1,10 @@
 import { NavLink } from 'react-router-dom'
 import {
   CloseIcon,
-  ContentIcon,
   DashboardIcon,
   LeadsIcon,
   LogoutIcon,
+  OperationIcon,
   ProductsIcon,
   SettingsIcon,
 } from './AdminIcons.jsx'
@@ -22,9 +22,9 @@ const navigationItems = [
     icon: ProductsIcon,
   },
   {
-    to: '/admin/conteudo',
-    label: 'Conteúdo',
-    icon: ContentIcon,
+    to: '/admin/operacao',
+    label: 'Operacao',
+    icon: OperationIcon,
   },
   {
     to: '/admin/leads',
@@ -33,7 +33,7 @@ const navigationItems = [
   },
   {
     to: '/admin/configuracoes',
-    label: 'Configurações',
+    label: 'Configuracoes',
     icon: SettingsIcon,
   },
 ]

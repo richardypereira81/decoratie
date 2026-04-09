@@ -8,6 +8,25 @@ const shortDateFormatter = new Intl.DateTimeFormat('pt-BR', {
   timeStyle: 'short',
 })
 
+const dateFormatter = new Intl.DateTimeFormat('pt-BR', {
+  dateStyle: 'short',
+})
+
+const numberFormatter = new Intl.NumberFormat('pt-BR', {
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+})
+
+function cleanTextValue(value) {
+  const normalized = String(value ?? '').trim()
+
+  if (!normalized || /^(undefined|null|nan)$/i.test(normalized)) {
+    return ''
+  }
+
+  return normalized
+}
+
 export function getDateValue(value) {
   if (!value) {
     return null
@@ -30,9 +49,41 @@ export function formatCurrency(value) {
   return currencyFormatter.format(Number.isFinite(numericValue) ? numericValue : 0)
 }
 
+export function roundCurrencyValue(value) {
+  const numericValue = Number(value)
+  return Number.isFinite(numericValue) ? Math.round(numericValue) : 0
+}
+
+export function formatRoundedCurrency(value) {
+  return formatCurrency(roundCurrencyValue(value))
+}
+
 export function formatDateTime(value, fallback = '--') {
   const date = getDateValue(value)
   return date ? shortDateFormatter.format(date) : fallback
+}
+
+export function formatDate(value, fallback = '--') {
+  const date = getDateValue(value)
+  return date ? dateFormatter.format(date) : fallback
+}
+
+export function formatNumber(value, fallback = '0,00') {
+  const numericValue = Number(value)
+  return Number.isFinite(numericValue) ? numberFormatter.format(numericValue) : fallback
+}
+
+export function sanitizeTextValue(value, fallback = '') {
+  return cleanTextValue(value) || fallback
+}
+
+export function normalizeUppercaseText(value, fallback = '') {
+  const normalized = sanitizeTextValue(value, fallback)
+  return normalized ? normalized.toLocaleUpperCase('pt-BR') : ''
+}
+
+export function formatUppercaseText(value, fallback = '--') {
+  return normalizeUppercaseText(value, fallback)
 }
 
 export function sanitizeFileName(value) {

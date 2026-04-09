@@ -49,6 +49,17 @@ export function ContentIcon(props) {
   )
 }
 
+export function OperationIcon(props) {
+  return (
+    <IconBase {...props}>
+      <path d="M7 4h10l3 3v13a1 1 0 0 1-1 1H7a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z" />
+      <path d="M14 4v4h4" />
+      <path d="M9 12h6" />
+      <path d="M9 16h6" />
+    </IconBase>
+  )
+}
+
 export function LeadsIcon(props) {
   return (
     <IconBase {...props}>
@@ -141,6 +152,15 @@ export function CheckIcon(props) {
   return (
     <IconBase {...props}>
       <path d="m20 6-11 11-5-5" />
+    </IconBase>
+  )
+}
+
+export function EyeIcon(props) {
+  return (
+    <IconBase {...props}>
+      <path d="M2 12s3.6-6 10-6 10 6 10 6-3.6 6-10 6-10-6-10-6Z" />
+      <circle cx="12" cy="12" r="2.6" />
     </IconBase>
   )
 }
