@@ -1,0 +1,21 @@
+{
+  "name": "xml-importador-backend",
+  "version": "1.0.0",
+  "description": "Backend para importação de NF-e XML",
+  "main": "src/server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "multer": "^1.4.5-lts.1",
+    "fast-xml-parser": "^4.3.6",
+    "sqlite3": "^5.1.6",
+    "csv-stringify": "^6.4.4",
+    "exceljs": "^4.3.0",
+    "cors": "^2.8.5",
+    "uuid": "^9.0.0"
+  }
+}
