@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import DetalhesImportacao from './DetalhesImportacao';
 
 export default function Historico({ importacoes, onExportarCSV, onExportarXLSX, onAtualizar }) {
+  const API_URL = import.meta.env.VITE_API_URL || '/api';
   const [selecionada, setSelecionada] = useState(null);
   const [detalhes, setDetalhes] = useState(null);
   const [carregando, setCarregando] = useState(false);
@@ -10,7 +11,7 @@ export default function Historico({ importacoes, onExportarCSV, onExportarXLSX, 
     try {
       setCarregando(true);
       const res = await fetch(
-        `http://localhost:3001/api/importacoes/detalhes/${importacao.id}`
+        `${API_URL}/importacoes/detalhes/${importacao.id}`
       );
       if (res.ok) {
         const data = await res.json();

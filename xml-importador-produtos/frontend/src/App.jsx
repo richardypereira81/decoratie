@@ -17,7 +17,7 @@ export default function App() {
   const [xmlContent, setXmlContent] = useState(null);
   const [historicoVisivel, setHistoricoVisivel] = useState(false);
 
-  const API_URL = 'http://localhost:3001/api';
+  const API_URL = import.meta.env.VITE_API_URL || '/api';
 
   useEffect(() => {
     carregarImportacoes();
@@ -42,22 +42,36 @@ export default function App() {
 
   const handleUpload = async (arquivo, freteM) => {
     try {
+      if (!arquivo) {
+        throw new Error('Selecione um arquivo XML para continuar.');
+      }
+
+      if (arquivo.size === 0) {
+        throw new Error('O arquivo XML esta vazio. Gere ou baixe o XML novamente antes de importar.');
+      }
+
       setEstado('processando');
       exibirMensagem('Processando XML...', 'info');
 
-      const formData = new FormData();
-      formData.append('arquivo', arquivo);
-      formData.append('margemGlobal', margemGlobal);
-      if (freteM) {
-        formData.append('freteManual', freteM);
+      const conteudoXML = await arquivo.text();
+
+      if (!conteudoXML.trim()) {
+        throw new Error('O arquivo XML esta vazio. Gere ou baixe o XML novamente antes de importar.');
       }
 
-      const conteudoXML = await arquivo.text();
       setXmlContent(conteudoXML);
 
       const res = await fetch(`${API_URL}/importacoes/processar-xml`, {
         method: 'POST',
-        body: formData,
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          xmlContent: conteudoXML,
+          fileName: arquivo.name,
+          margemGlobal,
+          freteManual: freteM || null,
+        }),
       });
 
       if (!res.ok) {

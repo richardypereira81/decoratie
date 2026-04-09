@@ -1,9 +1,16 @@
 {
   "$schema": "https://raw.githubusercontent.com/firebase/firebase-tools/master/schema/firebase-config.json",
+  "functions": {
+    "source": "functions"
+  },
   "hosting": {
     "public": "dist",
     "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
     "rewrites": [
+      {
+        "source": "api/**",
+        "function": "api"
+      },
       {
         "source": "**",
         "destination": "/index.html"
