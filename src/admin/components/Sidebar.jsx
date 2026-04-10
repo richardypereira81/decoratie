@@ -5,6 +5,7 @@ import {
   LeadsIcon,
   LogoutIcon,
   OperationIcon,
+  OrdersIcon,
   ProductsIcon,
   SettingsIcon,
 } from './AdminIcons.jsx'
@@ -25,6 +26,11 @@ const navigationItems = [
     to: '/admin/operacao',
     label: 'Operacao',
     icon: OperationIcon,
+  },
+  {
+    to: '/admin/pedidos',
+    label: 'Pedidos',
+    icon: OrdersIcon,
   },
   {
     to: '/admin/leads',

@@ -203,6 +203,18 @@ export function MoreIcon(props) {
   )
 }
 
+export function OrdersIcon(props) {
+  return (
+    <IconBase {...props}>
+      <path d="M16 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V8Z" />
+      <path d="M15 3v4a1 1 0 0 0 1 1h4" />
+      <path d="M8 13h8" />
+      <path d="M8 17h8" />
+      <path d="M8 9h2" />
+    </IconBase>
+  )
+}
+
 export function CloseIcon(props) {
   return (
     <IconBase {...props}>

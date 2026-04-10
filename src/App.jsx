@@ -6,23 +6,27 @@ import DashboardPage from './admin/pages/DashboardPage.jsx'
 import LeadsPage from './admin/pages/LeadsPage.jsx'
 import LoginPage from './admin/pages/LoginPage.jsx'
 import Operacao from './admin/pages/Operacao.jsx'
+import OrdersPage from './admin/pages/OrdersPage.jsx'
 import ProductsPage from './admin/pages/ProductsPage.jsx'
 import SettingsPage from './admin/pages/SettingsPage.jsx'
 import './admin/admin.css'
-import LandingPage from './landing/LandingPage.jsx'
+import StorePage from './store/pages/StorePage.jsx'
+import CheckoutPage from './store/pages/CheckoutPage.jsx'
 
 export default function App() {
   return (
     <BrowserRouter>
       <AuthProvider>
         <Routes>
-          <Route path="/" element={<LandingPage />} />
+          <Route path="/" element={<StorePage />} />
+          <Route path="/checkout" element={<CheckoutPage />} />
           <Route path="/login" element={<LoginPage />} />
 
           <Route element={<ProtectedRoute />}>
             <Route path="/admin" element={<AdminLayout />}>
               <Route index element={<DashboardPage />} />
               <Route path="produtos" element={<ProductsPage />} />
+              <Route path="pedidos" element={<OrdersPage />} />
               <Route path="operacao" element={<Operacao />} />
               <Route path="conteudo" element={<Navigate replace to="/admin/operacao" />} />
               <Route path="leads" element={<LeadsPage />} />

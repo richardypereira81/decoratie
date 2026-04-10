@@ -21,7 +21,7 @@ export default function LandingPage() {
   })
 
   useEffect(() => {
-    document.title = 'Decoratie â€” Sua mesa nunca mais será comum.'
+    document.title = 'Decoratie - Sua mesa nunca mais será comum.'
   }, [])
 
   useEffect(() => {
