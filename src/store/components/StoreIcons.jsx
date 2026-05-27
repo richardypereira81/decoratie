@@ -35,6 +35,16 @@ export function CartIcon(props) {
   )
 }
 
+export function MenuIcon(props) {
+  return (
+    <IconBase {...props}>
+      <path d="M4 7h16" />
+      <path d="M4 12h16" />
+      <path d="M4 17h16" />
+    </IconBase>
+  )
+}
+
 export function CloseIcon(props) {
   return (
     <IconBase {...props}>
@@ -122,6 +132,14 @@ export function MapPinIcon(props) {
     <IconBase {...props}>
       <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0Z" />
       <circle cx="12" cy="10" r="3" />
+    </IconBase>
+  )
+}
+
+export function MessageCircleIcon(props) {
+  return (
+    <IconBase {...props}>
+      <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5Z" />
     </IconBase>
   )
 }

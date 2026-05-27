@@ -1,6 +1,8 @@
 import { startTransition, useCallback, useEffect, useMemo, useState } from 'react'
 import { useCart } from '../hooks/useCart.js'
 import { useProducts } from '../hooks/useProducts.js'
+import { useStoreSettings } from '../hooks/useStoreSettings.js'
+import { getWhatsAppUrlFromSettings } from '../../shared/whatsapp.js'
 import StoreHeader from '../components/StoreHeader.jsx'
 import FiltersBar from '../components/FiltersBar.jsx'
 import ProductGrid from '../components/ProductGrid.jsx'
@@ -12,8 +14,8 @@ import '../store.css'
 
 export default function StorePage() {
   const { items, addItem, removeItem, updateQuantity, totalItems, totalPrice } = useCart()
+  const { data: storeSettings } = useStoreSettings()
   const {
-    products,
     filteredProducts,
     categories,
     loading,
@@ -26,7 +28,7 @@ export default function StorePage() {
   } = useProducts()
 
   const [cartOpen, setCartOpen] = useState(false)
-  const [filtersOpen, setFiltersOpen] = useState(false)
+  const [navOpen, setNavOpen] = useState(false)
   const [addedItemName, setAddedItemName] = useState('')
   const [headerHeight, setHeaderHeight] = useState(92)
   const [activeProduct, setActiveProduct] = useState(null)
@@ -38,14 +40,29 @@ export default function StorePage() {
   }, [])
 
   useEffect(() => {
-    if (cartOpen || filtersOpen || activeProduct || notifyProduct) {
+    if (cartOpen || navOpen || activeProduct || notifyProduct) {
       document.body.classList.add('modal-open')
     } else {
       document.body.classList.remove('modal-open')
     }
 
     return () => document.body.classList.remove('modal-open')
-  }, [activeProduct, cartOpen, filtersOpen, notifyProduct])
+  }, [activeProduct, cartOpen, navOpen, notifyProduct])
+
+  useEffect(() => {
+    if (!navOpen) {
+      return undefined
+    }
+
+    function handleKeyDown(event) {
+      if (event.key === 'Escape') {
+        setNavOpen(false)
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [navOpen])
 
   useEffect(() => {
     if (!addedItemName) return undefined
@@ -55,18 +72,38 @@ export default function StorePage() {
   }, [addedItemName])
 
   const activeFilterCount = Number(category !== 'all') + Number(sort !== 'default')
+  const whatsappUrl = useMemo(
+    () => getWhatsAppUrlFromSettings(storeSettings),
+    [storeSettings]
+  )
   const pageStyle = useMemo(
     () => ({ '--store-header-offset': `${headerHeight}px` }),
     [headerHeight]
   )
+
+  const catalogTitle = useMemo(() => {
+    if (search.trim()) {
+      return 'Resultados'
+    }
+
+    if (category !== 'all') {
+      return category
+    }
+
+    return 'Mais vendidos'
+  }, [category, search])
 
   const sectionDescription = useMemo(() => {
     if (search.trim()) {
       return `Resultados para "${search.trim()}"`
     }
 
-    return 'Escolha com calma e finalize sua compra em poucos toques.'
-  }, [search])
+    if (category !== 'all') {
+      return 'Produtos disponiveis nesta categoria.'
+    }
+
+    return 'Favoritos para comprar agora.'
+  }, [category, search])
 
   const handleSearchChange = useCallback((value) => {
     startTransition(() => setSearch(value))
@@ -88,13 +125,12 @@ export default function StorePage() {
   }, [setCategory, setSort])
 
   const handleOpenCart = useCallback(() => {
-    setFiltersOpen(false)
+    setNavOpen(false)
     setCartOpen(true)
   }, [])
 
   const handleOpenProduct = useCallback((product) => {
     setCartOpen(false)
-    setFiltersOpen(false)
     setSelectedQuantity(1)
     setActiveProduct(product)
   }, [])
@@ -130,6 +166,7 @@ export default function StorePage() {
           cartCount={0}
           onCartOpen={() => {}}
           onHeightChange={handleHeaderHeightChange}
+          onMenuOpen={() => {}}
         />
         <main className="store-main container">
           <div className="store-loading">
@@ -149,76 +186,49 @@ export default function StorePage() {
         cartCount={totalItems}
         onCartOpen={handleOpenCart}
         onHeightChange={handleHeaderHeightChange}
+        onMenuOpen={() => setNavOpen(true)}
       />
 
       <main className="store-main">
-        <section className="store-banner">
-          <div className="container store-banner-inner">
-            <div className="store-banner-copy">
-              <span className="store-banner-eyebrow">Decoratie</span>
-              <h1 className="store-banner-title">
-                Sua mesa nunca mais sera <em>comum.</em>
-              </h1>
-              <p className="store-banner-subtitle">
-                Pecas exclusivas para montar composicoes elegantes, com compra simples e fluida no celular.
-              </p>
+        <div className="container store-catalog-layout">
+          <FiltersBar
+            categories={categories}
+            cartCount={totalItems}
+            category={category}
+            mobileOpen={navOpen}
+            onCartOpen={handleOpenCart}
+            onCategoryChange={handleCategoryChange}
+            onMobileClose={() => setNavOpen(false)}
+            sort={sort}
+            onSortChange={handleSortChange}
+            search={search}
+            onSearchChange={handleSearchChange}
+            onClear={handleClearFilters}
+            activeCount={activeFilterCount}
+            whatsappUrl={whatsappUrl}
+          />
 
-              <div className="store-banner-actions">
-                <a href="#produtos" className="store-btn store-btn-primary">
-                  Explorar colecao
-                </a>
-                <button type="button" className="store-btn store-btn-secondary" onClick={handleOpenCart}>
-                  Ver carrinho {totalItems > 0 ? `(${totalItems})` : ''}
-                </button>
+          <div className="store-catalog-main">
+            <section className="store-section" id="produtos">
+              <div className="store-section-header">
+                <div>
+                  <h2 className="store-section-title">{catalogTitle}</h2>
+                  <p className="store-section-description">{sectionDescription}</p>
+                </div>
+                <span className="store-section-count">
+                  {filteredProducts.length} {filteredProducts.length === 1 ? 'produto' : 'produtos'}
+                </span>
               </div>
-            </div>
 
-            <div className="store-banner-panel" aria-label="Destaques da loja">
-              <div className="store-banner-note">
-                <strong>{products.length} produtos disponiveis</strong>
-                <span>Catalogo atualizado em tempo real para voce comprar sem friccao.</span>
-              </div>
-
-              <ul className="store-banner-points">
-                <li>Busca rapida sempre visivel</li>
-                <li>Carrinho acessivel em qualquer etapa</li>
-                <li>Curadoria pensada para mesas autorais</li>
-              </ul>
-            </div>
+              <ProductGrid
+                products={filteredProducts}
+                onProductClick={handleOpenProduct}
+                onAddToCart={handleAddToCart}
+                emptyMessage="Nenhum produto encontrado."
+              />
+            </section>
           </div>
-        </section>
-
-        <section className="store-section container" id="produtos">
-          <div className="store-catalog-shell">
-            <div className="store-section-header">
-              <div>
-                <h2 className="store-section-title">Produtos</h2>
-                <p className="store-section-description">{sectionDescription}</p>
-              </div>
-              <span className="store-section-count">
-                {filteredProducts.length} {filteredProducts.length === 1 ? 'produto' : 'produtos'}
-              </span>
-            </div>
-
-            <FiltersBar
-              categories={categories}
-              category={category}
-              onCategoryChange={handleCategoryChange}
-              sort={sort}
-              onSortChange={handleSortChange}
-              onClear={handleClearFilters}
-              open={filtersOpen}
-              onOpenChange={setFiltersOpen}
-              activeCount={activeFilterCount}
-            />
-
-            <ProductGrid
-              products={filteredProducts}
-              onProductClick={handleOpenProduct}
-              emptyMessage="Nenhum produto encontrado com esses filtros."
-            />
-          </div>
-        </section>
+        </div>
       </main>
 
       <StoreFooter />

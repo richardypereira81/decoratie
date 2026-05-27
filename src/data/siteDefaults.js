@@ -23,7 +23,12 @@ export const defaultLandingContent = {
 }
 
 export const defaultSettings = {
-  whatsappLink: 'https://wa.me/5500000000000',
+  whatsappLink: '',
+  whatsapp: {
+    numero: '',
+    mensagemPadrao: 'Olá, vim pela loja Decoratie e gostaria de atendimento.',
+    ativo: false,
+  },
   instagramLink: 'https://instagram.com/decoratie',
   vipGroupLink: '#',
   ctaDefaultText: 'Quero conhecer',

@@ -6,7 +6,15 @@ export function useOrders() {
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState(null)
 
-  const createOrder = useCallback(async ({ cliente, itens, frete, total }) => {
+  const createOrder = useCallback(async ({
+    cliente,
+    frete,
+    itens,
+    subtotal,
+    total,
+    status = 'pendente',
+    pagamento = null,
+  }) => {
     setSubmitting(true)
     setError(null)
 
@@ -15,8 +23,10 @@ export function useOrders() {
         cliente,
         itens,
         frete,
+        subtotal,
         total,
-        status: 'pendente',
+        status,
+        pagamento,
         createdAt: serverTimestamp(),
       })
 

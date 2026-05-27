@@ -1,6 +1,7 @@
 import { useDeferredValue, useEffect, useMemo, useState } from 'react'
 import { collection, onSnapshot } from 'firebase/firestore'
 import { db } from '../../lib/firebaseClient.js'
+import { normalizeProductCategories, productMatchesCategory } from '../../shared/productCategories.js'
 
 export function useProducts() {
   const [products, setProducts] = useState([])
@@ -31,11 +32,11 @@ export function useProducts() {
   }, [])
 
   const uniqueCategories = useMemo(() => {
-    if (categories.length > 0) {
-      return categories.map((c) => c.nome || c.id).filter(Boolean)
-    }
-    const fromProducts = [...new Set(products.map((p) => p.categoria).filter(Boolean))]
-    return fromProducts.sort((a, b) => a.localeCompare(b, 'pt-BR'))
+    const fromSavedCategories = categories.map((c) => c.nome || c.id).filter(Boolean)
+    const fromProducts = products.flatMap((product) => normalizeProductCategories(product))
+    return [...new Set([...fromSavedCategories, ...fromProducts])]
+      .filter(Boolean)
+      .sort((a, b) => a.localeCompare(b, 'pt-BR'))
   }, [categories, products])
 
   const filteredProducts = useMemo(() => {
@@ -44,12 +45,12 @@ export function useProducts() {
     if (deferredSearch.trim()) {
       const q = deferredSearch.trim().toLowerCase()
       result = result.filter((p) =>
-        [p.nome, p.descricao, p.categoria].join(' ').toLowerCase().includes(q)
+        [p.nome, p.descricao, ...normalizeProductCategories(p)].join(' ').toLowerCase().includes(q)
       )
     }
 
     if (category !== 'all') {
-      result = result.filter((p) => p.categoria === category)
+      result = result.filter((p) => productMatchesCategory(p, category))
     }
 
     switch (sort) {

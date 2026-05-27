@@ -12,10 +12,12 @@ function joinClassNames(...values) {
 
 export default function ToolbarDropdown({
   align = 'end',
+  backdropClassName = '',
   children,
   className = '',
   panelClassName = '',
   renderButton,
+  showBackdrop = false,
 }) {
   const [open, setOpen] = useState(false)
   const panelId = useId()
@@ -67,20 +69,34 @@ export default function ToolbarDropdown({
 
       <AnimatePresence>
         {open ? (
-          <motion.div
-            id={panelId}
-            initial={{ opacity: 0, scale: 0.96, y: -8 }}
-            animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.98, y: -6 }}
-            transition={popoverTransition}
-            className={joinClassNames(
-              'admin-toolbar-popover',
-              align === 'start' ? 'is-start' : 'is-end',
-              panelClassName
-            )}
-          >
-            {typeof children === 'function' ? children({ close }) : children}
-          </motion.div>
+          <>
+            {showBackdrop ? (
+              <motion.button
+                type="button"
+                aria-label="Fechar filtros"
+                className={joinClassNames('admin-toolbar-backdrop', backdropClassName)}
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={popoverTransition}
+                onClick={close}
+              />
+            ) : null}
+            <motion.div
+              id={panelId}
+              initial={{ opacity: 0, scale: 0.96, y: -8 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.98, y: -6 }}
+              transition={popoverTransition}
+              className={joinClassNames(
+                'admin-toolbar-popover',
+                align === 'start' ? 'is-start' : 'is-end',
+                panelClassName
+              )}
+            >
+              {typeof children === 'function' ? children({ close }) : children}
+            </motion.div>
+          </>
         ) : null}
       </AnimatePresence>
     </div>

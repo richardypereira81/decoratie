@@ -19,6 +19,7 @@ export default [
         window: 'readonly',
         console: 'readonly',
         URL: 'readonly',
+        URLSearchParams: 'readonly',
         fetch: 'readonly',
         alert: 'readonly',
         setTimeout: 'readonly',

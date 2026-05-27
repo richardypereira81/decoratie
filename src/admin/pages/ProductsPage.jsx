@@ -1,8 +1,9 @@
-import { useDeferredValue, useMemo, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useState } from "react";
 import {
   collection,
   deleteDoc,
   doc,
+  runTransaction,
   serverTimestamp,
   setDoc,
   updateDoc,
@@ -18,6 +19,11 @@ import {
   getInitials,
   normalizeUppercaseText,
 } from "../../shared/formatters.js";
+import {
+  getPrimaryProductCategory,
+  normalizeProductCategories,
+  productMatchesCategory,
+} from "../../shared/productCategories.js";
 import ActionsDropdown from "../components/ActionsDropdown.jsx";
 import {
   CheckIcon,
@@ -82,18 +88,43 @@ function ProductIdentityCell({ product }) {
   );
 }
 
-function ProductStockCell({ product }) {
-  const hasStoredValue =
-    product.estoque !== "" &&
-    product.estoque !== null &&
-    product.estoque !== undefined;
-  const stockValue = hasStoredValue ? Number(product.estoque) : Number.NaN;
-  const hasInventoryControl = Number.isFinite(stockValue);
+function getStockValue(value) {
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) && numericValue > 0
+    ? Math.floor(numericValue)
+    : 0;
+}
+
+function ProductStockCell({ disabled = false, onAdjust, product, stockOverride }) {
+  const stockValue = getStockValue(stockOverride ?? product.estoque);
+  const productName = formatUppercaseText(product.nome, "produto");
 
   return (
-    <div className="admin-table-stack">
-      <strong>{hasInventoryControl ? stockValue : "--"}</strong>
-      <span>{hasInventoryControl ? "unidades" : "Sem controle"}</span>
+    <div className={`admin-stock-control ${disabled ? "is-saving" : ""}`}>
+      <button
+        type="button"
+        className="admin-stock-btn"
+        onClick={() => onAdjust(product, -1)}
+        disabled={disabled || stockValue <= 0}
+        aria-label={`Diminuir estoque de ${productName}`}
+      >
+        -
+      </button>
+
+      <div className="admin-stock-value" aria-live="polite">
+        <strong>{stockValue}</strong>
+        <span>{disabled ? "Salvando" : "unidades"}</span>
+      </div>
+
+      <button
+        type="button"
+        className="admin-stock-btn"
+        onClick={() => onAdjust(product, 1)}
+        disabled={disabled}
+        aria-label={`Aumentar estoque de ${productName}`}
+      >
+        +
+      </button>
     </div>
   );
 }
@@ -101,9 +132,31 @@ function ProductStockCell({ product }) {
 function listOptions(values) {
   return [
     ...new Set(
-      values.map((value) => String(value || "").trim()).filter(Boolean),
+      values.flatMap((value) => (
+        Array.isArray(value)
+          ? normalizeProductCategories(value)
+          : [String(value || "").trim()].filter(Boolean)
+      )),
     ),
   ].sort((first, second) => first.localeCompare(second, "pt-BR"));
+}
+
+function getProductCategories(product) {
+  return normalizeProductCategories(product);
+}
+
+function formatProductCategories(product) {
+  const categories = getProductCategories(product);
+
+  if (!categories.length) {
+    return "SEM CATEGORIA";
+  }
+
+  if (categories.length <= 2) {
+    return categories.join(", ");
+  }
+
+  return `${categories.slice(0, 2).join(", ")} +${categories.length - 2}`;
 }
 
 function buildFileStamp() {
@@ -145,16 +198,37 @@ export default function ProductsPage() {
   const [editingProduct, setEditingProduct] = useState(null);
   const [saving, setSaving] = useState(false);
   const [bulkDeleting, setBulkDeleting] = useState(false);
+  const [stockAdjusting, setStockAdjusting] = useState({});
+  const [stockOverrides, setStockOverrides] = useState({});
   const deferredSearch = useDeferredValue(search);
 
   const categories = useMemo(
-    () => listOptions(products.map((product) => product.categoria)),
+    () => listOptions(products.flatMap((product) => getProductCategories(product))),
     [products],
   );
   const sectors = useMemo(
     () => listOptions(products.map((product) => product.setor)),
     [products],
   );
+
+  useEffect(() => {
+    setStockOverrides((current) => {
+      let changed = false;
+      const next = { ...current };
+
+      products.forEach((product) => {
+        if (
+          next[product.id] !== undefined &&
+          getStockValue(product.estoque) === next[product.id]
+        ) {
+          delete next[product.id];
+          changed = true;
+        }
+      });
+
+      return changed ? next : current;
+    });
+  }, [products]);
 
   const filteredProducts = useMemo(() => {
     const normalizedSearch = deferredSearch.trim().toLowerCase();
@@ -172,7 +246,8 @@ export default function ProductsPage() {
         return secondDate - firstDate;
       })
       .filter((product) => {
-        const category = String(product.categoria || "").trim();
+        const productCategories = getProductCategories(product);
+        const categoryText = productCategories.join(" ");
         const sector = String(product.setor || "").trim();
         const isActive = product.ativo !== false;
         const ultimaNotaCompra = String(product.ultimaNotaCompra || "").trim();
@@ -184,7 +259,7 @@ export default function ProductsPage() {
         if (normalizedSearch) {
           const haystack = [
             product.nome,
-            category,
+            categoryText,
             sector,
             resolveProductDescription(product),
             product.codigoProduto,
@@ -220,7 +295,7 @@ export default function ProductsPage() {
           return false;
         }
 
-        if (filters.category !== "all" && category !== filters.category) {
+        if (filters.category !== "all" && !productMatchesCategory(product, filters.category)) {
           return false;
         }
 
@@ -267,9 +342,9 @@ export default function ProductsPage() {
       cell: (product) => (
         <div className="admin-table-stack">
           <strong>
-            {formatUppercaseText(product.categoria, "SEM CATEGORIA")}
+            {formatUppercaseText(formatProductCategories(product), "SEM CATEGORIA")}
           </strong>
-          <span>CLASSIFICACAO PRINCIPAL</span>
+          <span>{getProductCategories(product).length > 1 ? "MULTIPLAS CATEGORIAS" : "CLASSIFICACAO PRINCIPAL"}</span>
         </div>
       ),
     },
@@ -295,7 +370,14 @@ export default function ProductsPage() {
     {
       key: "estoque",
       header: "Estoque",
-      cell: (product) => <ProductStockCell product={product} />,
+      cell: (product) => (
+        <ProductStockCell
+          disabled={Boolean(stockAdjusting[product.id])}
+          product={product}
+          stockOverride={stockOverrides[product.id]}
+          onAdjust={adjustProductStock}
+        />
+      ),
     },
     {
       key: "actions",
@@ -345,6 +427,58 @@ export default function ProductsPage() {
   function openEditProduct(product) {
     setEditingProduct(product);
     setModalOpen(true);
+  }
+
+  async function adjustProductStock(product, delta) {
+    if (!product?.id || stockAdjusting[product.id]) {
+      return;
+    }
+
+    const previousStock = getStockValue(stockOverrides[product.id] ?? product.estoque);
+    const optimisticStock = Math.max(0, previousStock + delta);
+
+    if (delta < 0 && previousStock <= 0) {
+      return;
+    }
+
+    setStockAdjusting((current) => ({ ...current, [product.id]: true }));
+    setStockOverrides((current) => ({ ...current, [product.id]: optimisticStock }));
+
+    try {
+      const productRef = doc(db, "produtos", product.id);
+      const savedStock = await runTransaction(db, async (transaction) => {
+        const snapshot = await transaction.get(productRef);
+
+        if (!snapshot.exists()) {
+          throw new Error("Produto nao encontrado.");
+        }
+
+        const currentStock = getStockValue(snapshot.data().estoque);
+        const nextStock = Math.max(0, currentStock + delta);
+
+        transaction.update(productRef, {
+          estoque: nextStock,
+          updatedAt: serverTimestamp(),
+        });
+
+        return nextStock;
+      });
+
+      setStockOverrides((current) => ({ ...current, [product.id]: savedStock }));
+    } catch (error) {
+      setStockOverrides((current) => ({ ...current, [product.id]: previousStock }));
+      notify({
+        type: "error",
+        title: "Nao foi possivel ajustar o estoque",
+        description: error.message || "Tente novamente.",
+      });
+    } finally {
+      setStockAdjusting((current) => {
+        const next = { ...current };
+        delete next[product.id];
+        return next;
+      });
+    }
   }
 
   async function deleteAllProducts() {
@@ -456,6 +590,15 @@ export default function ProductsPage() {
         imagePath = uploaded.path;
       }
 
+      const selectedCategories = normalizeProductCategories(
+        draft.categorias,
+        draft.categoria,
+      );
+
+      if (!selectedCategories.length) {
+        throw new Error("Selecione pelo menos uma categoria.");
+      }
+
       const payload = {
         nome: normalizeUppercaseText(draft.nome),
         descricao: normalizeUppercaseText(resolveProductDescription(draft)),
@@ -469,7 +612,8 @@ export default function ProductsPage() {
           : Number.isFinite(draft.preco)
             ? draft.preco
             : 0,
-        categoria: normalizeUppercaseText(draft.categoria),
+        categoria: selectedCategories[0],
+        categorias: selectedCategories,
         setor: normalizeUppercaseText(draft.setor),
         estoque: Number.isFinite(draft.estoque) ? draft.estoque : null,
         codigoProduto: normalizeUppercaseText(draft.codigoProduto),
@@ -482,6 +626,12 @@ export default function ProductsPage() {
         custoReal: Number.isFinite(draft.custoReal) ? draft.custoReal : null,
         margemPadrao: Number.isFinite(draft.margemPadrao)
           ? draft.margemPadrao
+          : null,
+        peso: Number.isFinite(draft.peso) ? draft.peso : null,
+        altura: Number.isFinite(draft.altura) ? draft.altura : null,
+        largura: Number.isFinite(draft.largura) ? draft.largura : null,
+        comprimento: Number.isFinite(draft.comprimento)
+          ? draft.comprimento
           : null,
         destaque: Boolean(draft.destaque),
         ativo: Boolean(draft.ativo),
@@ -578,7 +728,8 @@ export default function ProductsPage() {
       columns: [
         { label: "Nome", value: (product) => product.nome },
         { label: "Codigo", value: (product) => product.codigoProduto || "" },
-        { label: "Categoria", value: (product) => product.categoria || "" },
+        { label: "Categoria", value: (product) => getPrimaryProductCategory(product) },
+        { label: "Categorias", value: (product) => getProductCategories(product).join(", ") },
         { label: "Setor", value: (product) => product.setor || "" },
         { label: "NCM", value: (product) => product.ncm || "" },
         { label: "CEST", value: (product) => product.cest || "" },
@@ -601,6 +752,13 @@ export default function ProductsPage() {
             formatRoundedCurrency(product.precoVenda ?? product.preco),
         },
         { label: "Estoque", value: (product) => product.estoque ?? "" },
+        { label: "Peso kg", value: (product) => product.peso ?? "" },
+        { label: "Altura cm", value: (product) => product.altura ?? "" },
+        { label: "Largura cm", value: (product) => product.largura ?? "" },
+        {
+          label: "Comprimento cm",
+          value: (product) => product.comprimento ?? "",
+        },
         {
           label: "Status",
           value: (product) => (product.ativo !== false ? "Ativo" : "Inativo"),

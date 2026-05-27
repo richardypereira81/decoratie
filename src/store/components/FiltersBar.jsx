@@ -1,96 +1,134 @@
-import { memo, useEffect, useState } from 'react'
-import { CloseIcon, FilterIcon } from './StoreIcons.jsx'
+import { memo } from 'react'
+import { Link } from 'react-router-dom'
+import { CartIcon, CloseIcon, MessageCircleIcon, SearchIcon } from './StoreIcons.jsx'
 
 function FiltersBar({
   categories,
+  cartCount,
   category,
+  mobileOpen,
+  onCartOpen,
   onCategoryChange,
+  onMobileClose,
   sort,
   onSortChange,
+  search,
+  onSearchChange,
   onClear,
-  open,
-  onOpenChange,
   activeCount,
+  whatsappUrl,
 }) {
-  const [draftCategory, setDraftCategory] = useState(category)
-  const [draftSort, setDraftSort] = useState(sort)
+  const visibleCategories = categories.filter(Boolean)
 
-  useEffect(() => {
-    setDraftCategory(category)
-    setDraftSort(sort)
-  }, [category, sort, open])
-
-  useEffect(() => {
-    if (!open) return undefined
-
-    function handleResize() {
-      if (window.innerWidth >= 768) {
-        onOpenChange(false)
-      }
-    }
-
-    window.addEventListener('resize', handleResize)
-    return () => window.removeEventListener('resize', handleResize)
-  }, [open, onOpenChange])
-
-  function handleApply() {
-    onCategoryChange(draftCategory)
-    onSortChange(draftSort)
-    onOpenChange(false)
+  function handleCategorySelect(value) {
+    onCategoryChange(value)
+    onMobileClose?.()
   }
 
-  function handleReset() {
-    setDraftCategory('all')
-    setDraftSort('default')
+  function handleCartOpen() {
+    onMobileClose?.()
+    onCartOpen?.()
+  }
+
+  function handleSortSelect(value) {
+    onSortChange(value)
+    onMobileClose?.()
+  }
+
+  function handleWhatsAppClick() {
+    onMobileClose?.()
   }
 
   return (
-    <>
-      <div className="store-filters-mobile">
+    <aside className="store-filter-sidebar" aria-label="Filtros da vitrine">
+      {mobileOpen && (
         <button
           type="button"
-          className="store-filters-trigger"
-          onClick={() => onOpenChange(true)}
-          aria-haspopup="dialog"
-          aria-expanded={open}
-        >
-          <span className="store-filters-trigger-copy">
-            <FilterIcon className="store-filters-trigger-icon" />
-            Filtros e ordenacao
-          </span>
-          {activeCount > 0 && <span className="store-filters-trigger-count">{activeCount}</span>}
-        </button>
+          className="store-filter-backdrop"
+          aria-label="Fechar menu"
+          onClick={onMobileClose}
+        />
+      )}
 
-        {activeCount > 0 && (
-          <button type="button" className="store-filters-link" onClick={onClear}>
-            Limpar
-          </button>
-        )}
-      </div>
-
-      <div className="store-filters store-filters-desktop">
-        <div className="store-filters-group">
-          <label className="store-filter-label" htmlFor="store-category">Categoria</label>
-          <select
-            id="store-category"
-            className="store-select"
-            value={category}
-            onChange={(e) => onCategoryChange(e.target.value)}
+      <div
+        id="store-filter-panel"
+        className={`store-filter-panel ${mobileOpen ? 'is-open' : ''}`}
+        role={mobileOpen ? 'dialog' : undefined}
+        aria-modal={mobileOpen ? 'true' : undefined}
+      >
+        <div className="store-filter-panel-head">
+          <Link to="/" className="store-filter-logo" aria-label="Decoratie - Ir para a loja">
+            <img src="/Logo - Decoratie-01.png" alt="Decoratie" />
+          </Link>
+          <button
+            type="button"
+            className="store-filter-close"
+            aria-label="Fechar menu"
+            onClick={onMobileClose}
           >
-            <option value="all">Todas</option>
-            {categories.map((cat) => (
-              <option key={cat} value={cat}>{cat}</option>
-            ))}
-          </select>
+            <CloseIcon />
+          </button>
         </div>
 
-        <div className="store-filters-group">
+        <div className="store-filter-mobile-tools">
+          <div className="store-search store-filter-search">
+            <SearchIcon className="store-search-icon" />
+            <input
+              type="search"
+              placeholder="Buscar produtos"
+              value={search}
+              onChange={(e) => onSearchChange(e.target.value)}
+              className="store-search-input"
+              aria-label="Buscar produtos"
+            />
+          </div>
+
+          <button type="button" className="store-filter-cart-link" onClick={handleCartOpen}>
+            <CartIcon className="store-cart-icon" />
+            <span>Carrinho</span>
+            {cartCount > 0 && <strong>{cartCount}</strong>}
+          </button>
+        </div>
+
+        <div className="store-filter-group">
+          <div className="store-filter-heading">
+            <h2>Categorias</h2>
+            {activeCount > 0 && (
+              <button type="button" className="store-filters-link" onClick={onClear}>
+                Limpar
+              </button>
+            )}
+          </div>
+
+          <div className="store-filter-category-list" aria-label="Categorias de produtos">
+            <button
+              type="button"
+              className={`store-filter-category ${category === 'all' ? 'is-active' : ''}`}
+              onClick={() => handleCategorySelect('all')}
+            >
+              Ver todos
+            </button>
+
+            {visibleCategories.map((cat) => (
+              <button
+                type="button"
+                key={cat}
+                className={`store-filter-category ${category === cat ? 'is-active' : ''}`}
+                onClick={() => handleCategorySelect(cat)}
+              >
+                {cat}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="store-filter-group">
           <label className="store-filter-label" htmlFor="store-sort">Ordenar</label>
           <select
             id="store-sort"
-            className="store-select"
+            className="store-select store-sort-select"
             value={sort}
-            onChange={(e) => onSortChange(e.target.value)}
+            onChange={(e) => handleSortSelect(e.target.value)}
           >
             <option value="default">Relevancia</option>
             <option value="price-asc">Menor preco</option>
@@ -99,85 +137,22 @@ function FiltersBar({
           </select>
         </div>
 
-        {activeCount > 0 && (
-          <button type="button" className="store-filters-link" onClick={onClear}>
-            Limpar filtros
-          </button>
-        )}
+        {whatsappUrl ? (
+          <div className="store-filter-contact">
+            <a
+              className="store-filter-whatsapp"
+              href={whatsappUrl}
+              target="_blank"
+              rel="noreferrer"
+              onClick={handleWhatsAppClick}
+            >
+              <MessageCircleIcon />
+              <span>Falar no WhatsApp</span>
+            </a>
+          </div>
+        ) : null}
       </div>
-
-      <div
-        className={`store-sheet-backdrop ${open ? 'is-visible' : ''}`}
-        onClick={() => onOpenChange(false)}
-        aria-hidden={!open}
-      />
-
-      <section
-        className={`store-filters-sheet ${open ? 'is-open' : ''}`}
-        role="dialog"
-        aria-modal="true"
-        aria-label="Filtros e ordenacao"
-      >
-        <div className="store-filters-sheet-handle" />
-
-        <div className="store-filters-sheet-header">
-          <div>
-            <p className="store-filters-sheet-eyebrow">Navegacao da vitrine</p>
-            <h3 className="store-filters-sheet-title">Filtros e ordenacao</h3>
-          </div>
-
-          <button
-            type="button"
-            className="store-filters-sheet-close"
-            onClick={() => onOpenChange(false)}
-            aria-label="Fechar filtros"
-          >
-            <CloseIcon />
-          </button>
-        </div>
-
-        <div className="store-filters-sheet-body">
-          <div className="store-filters-group store-filters-group-stack">
-            <label className="store-filter-label" htmlFor="store-category-mobile">Categoria</label>
-            <select
-              id="store-category-mobile"
-              className="store-select"
-              value={draftCategory}
-              onChange={(e) => setDraftCategory(e.target.value)}
-            >
-              <option value="all">Todas</option>
-              {categories.map((cat) => (
-                <option key={cat} value={cat}>{cat}</option>
-              ))}
-            </select>
-          </div>
-
-          <div className="store-filters-group store-filters-group-stack">
-            <label className="store-filter-label" htmlFor="store-sort-mobile">Ordenar</label>
-            <select
-              id="store-sort-mobile"
-              className="store-select"
-              value={draftSort}
-              onChange={(e) => setDraftSort(e.target.value)}
-            >
-              <option value="default">Relevancia</option>
-              <option value="price-asc">Menor preco</option>
-              <option value="price-desc">Maior preco</option>
-              <option value="recent">Mais recentes</option>
-            </select>
-          </div>
-        </div>
-
-        <div className="store-filters-sheet-footer">
-          <button type="button" className="store-btn store-btn-secondary store-btn-block" onClick={handleReset}>
-            Limpar selecao
-          </button>
-          <button type="button" className="store-btn store-btn-primary store-btn-block" onClick={handleApply}>
-            Aplicar filtros
-          </button>
-        </div>
-      </section>
-    </>
+    </aside>
   )
 }
 

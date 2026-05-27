@@ -1,5 +1,6 @@
 import { memo, useEffect, useId } from 'react'
 import { formatCurrency } from '../../shared/formatters.js'
+import { getPrimaryProductCategory } from '../../shared/productCategories.js'
 import { BellIcon, CartIcon, CloseIcon } from './StoreIcons.jsx'
 import QuantitySelector from './QuantitySelector.jsx'
 
@@ -39,8 +40,8 @@ function ProductModal({
   const description = product.descricao?.trim()
   const totalPrice = price * quantity
   const imageAlt = product.nome || 'Produto'
-  const priceLabel = formatCurrency(price)
   const totalPriceLabel = formatCurrency(totalPrice)
+  const category = getPrimaryProductCategory(product)
 
   function handleDecrease() {
     onQuantityChange(Math.max(1, quantity - 1))
@@ -86,8 +87,8 @@ function ProductModal({
 
             <div className="store-product-modal-body">
               <div className="store-product-modal-copy">
-                {product.categoria && (
-                  <span className="store-card-category">{product.categoria}</span>
+                {category && (
+                  <span className="store-card-category">{category}</span>
                 )}
 
                 <h3 id={titleId} className="store-product-modal-title">
@@ -95,7 +96,7 @@ function ProductModal({
                 </h3>
 
                 <p id={descriptionId} className="store-product-modal-description">
-                  {description || 'Peca selecionada para compor sua mesa com acabamento elegante e compra fluida.'}
+                  {description || 'Produto disponivel para compra no catalogo Decoratie.'}
                 </p>
               </div>
 

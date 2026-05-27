@@ -1,7 +1,7 @@
 import { memo } from 'react'
 import ProductCard from './ProductCard.jsx'
 
-function ProductGrid({ products, onProductClick, emptyMessage }) {
+function ProductGrid({ products, onProductClick, onAddToCart, emptyMessage }) {
   if (!products.length) {
     return (
       <div className="store-empty">
@@ -13,7 +13,12 @@ function ProductGrid({ products, onProductClick, emptyMessage }) {
   return (
     <div className="store-grid">
       {products.map((product) => (
-        <ProductCard key={product.id} product={product} onProductClick={onProductClick} />
+        <ProductCard
+          key={product.id}
+          product={product}
+          onProductClick={onProductClick}
+          onAddToCart={onAddToCart}
+        />
       ))}
     </div>
   )

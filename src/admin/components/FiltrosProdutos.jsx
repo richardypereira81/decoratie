@@ -1,4 +1,4 @@
-import { ChevronDownIcon, FilterIcon } from './AdminIcons.jsx'
+import { ChevronDownIcon, CloseIcon, FilterIcon } from './AdminIcons.jsx'
 import ToolbarDropdown from './ToolbarDropdown.jsx'
 
 function joinClassNames(...values) {
@@ -22,8 +22,10 @@ export default function FiltrosProdutos({
 
   return (
     <ToolbarDropdown
+      backdropClassName="admin-products-filter-backdrop"
       className="admin-toolbar-control"
-      panelClassName="admin-filter-popover admin-operacao-filter-popover"
+      panelClassName="admin-filter-popover admin-operacao-filter-popover admin-products-filter-drawer"
+      showBackdrop
       renderButton={({ open, panelId, toggle }) => (
         <button
           type="button"
@@ -40,7 +42,24 @@ export default function FiltrosProdutos({
         </button>
       )}
     >
-      <div className="admin-filter-panel">
+      {({ close }) => (
+        <>
+          <div className="admin-filter-drawer-head">
+            <div>
+              <strong>Filtros</strong>
+              <span>{activeCount ? `${activeCount} ativo(s)` : 'Produtos'}</span>
+            </div>
+            <button
+              type="button"
+              className="admin-filter-drawer-close"
+              onClick={close}
+              aria-label="Fechar filtros"
+            >
+              <CloseIcon className="admin-inline-icon" />
+            </button>
+          </div>
+
+          <div className="admin-filter-panel">
         <section className="admin-filter-section">
           <div className="admin-filter-section-head">
             <strong>Status</strong>
@@ -207,7 +226,9 @@ export default function FiltrosProdutos({
             </button>
           </div>
         ) : null}
-      </div>
+          </div>
+        </>
+      )}
     </ToolbarDropdown>
   )
 }

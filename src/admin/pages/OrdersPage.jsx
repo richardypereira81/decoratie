@@ -2,7 +2,9 @@ import { useDeferredValue, useMemo, useState } from 'react'
 import { doc, updateDoc, serverTimestamp } from 'firebase/firestore'
 import { db } from '../../lib/firebaseClient.js'
 import { formatCurrency, formatDateTime, getDateValue } from '../../shared/formatters.js'
+import { consultMercadoPagoPayment } from '../../shared/paymentApi.js'
 import { useCollectionData } from '../hooks/useFirestoreData.js'
+import { useAuthSession } from '../AuthContext.jsx'
 import { useAdminUI } from '../components/AdminLayout.jsx'
 import SearchInput from '../components/SearchInput.jsx'
 import Toolbar from '../components/Toolbar.jsx'
@@ -13,6 +15,9 @@ import { EyeIcon } from '../components/AdminIcons.jsx'
 const STATUS_OPTIONS = [
   { value: 'all', label: 'Todos' },
   { value: 'pendente', label: 'Pendente' },
+  { value: 'aguardando_pagamento', label: 'Aguardando pagamento' },
+  { value: 'pagamento_pendente', label: 'Pagamento pendente' },
+  { value: 'pagamento_recusado', label: 'Pagamento recusado' },
   { value: 'pago', label: 'Pago' },
   { value: 'enviado', label: 'Enviado' },
   { value: 'entregue', label: 'Entregue' },
@@ -21,18 +26,138 @@ const STATUS_OPTIONS = [
 
 const STATUS_COLORS = {
   pendente: 'is-warning',
+  aguardando_pagamento: 'is-warning',
+  pagamento_pendente: 'is-warning',
+  pagamento_recusado: 'is-muted',
   pago: 'is-accent',
   enviado: 'is-info',
   entregue: 'is-live',
   cancelado: 'is-muted',
 }
 
+function getFreteLabel(frete) {
+  if (!frete) {
+    return 'Sem frete'
+  }
+
+  if (frete.provider === 'melhor_envio') {
+    return [frete.transportadora, frete.modalidade].filter(Boolean).join(' ') || 'Melhor Envio'
+  }
+
+  return frete.modalidade || frete.tipo || 'Manual'
+}
+
+function getFretePrazo(frete) {
+  if (!frete) {
+    return '--'
+  }
+
+  if (frete.prazoMinFinal && frete.prazoMaxFinal) {
+    return frete.prazoTexto || (
+      frete.prazoMinFinal === frete.prazoMaxFinal
+        ? `${frete.prazoMinFinal} dias uteis`
+        : `${frete.prazoMinFinal} a ${frete.prazoMaxFinal} dias uteis`
+    )
+  }
+
+  if (frete.prazoFinalCliente) {
+    return frete.prazoTexto || `${frete.prazoFinalCliente} dias uteis`
+  }
+
+  return frete.prazoTexto || (frete.prazo ? `${frete.prazo} dias uteis` : '--')
+}
+
+function getFretePrazoOriginal(frete) {
+  if (!frete) {
+    return '--'
+  }
+
+  if (frete.prazoMinOriginal && frete.prazoMaxOriginal) {
+    return frete.prazoMinOriginal === frete.prazoMaxOriginal
+      ? `${frete.prazoMinOriginal} dias uteis`
+      : `${frete.prazoMinOriginal} a ${frete.prazoMaxOriginal} dias uteis`
+  }
+
+  return frete.prazoOriginalTransportadora
+    ? `${frete.prazoOriginalTransportadora} dias uteis`
+    : '--'
+}
+
+function formatDocumentoCliente(cliente = {}) {
+  const digits = String(cliente.documentoLimpo || cliente.documento || '').replace(/\D/g, '')
+
+  if (digits.length === 11) {
+    return digits
+      .replace(/^(\d{3})(\d{3})(\d{3})(\d{2})$/, '$1.$2.$3-$4')
+  }
+
+  if (digits.length === 14) {
+    return digits
+      .replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/, '$1.$2.$3/$4-$5')
+  }
+
+  return cliente.documento || '--'
+}
+
+function getPagamentoMetodoLabel(pagamento) {
+  if (!pagamento) {
+    return 'Sem pagamento'
+  }
+
+  if (pagamento.provider !== 'mercado_pago') {
+    return pagamento.metodo || pagamento.provider || 'Pagamento'
+  }
+
+  const labels = {
+    pix: 'Pix',
+    credit_card: 'Cartao de credito',
+    debit_card: 'Cartao de debito',
+  }
+
+  return labels[pagamento.metodo] || 'Mercado Pago'
+}
+
+function getPagamentoStatusLabel(pagamento) {
+  if (!pagamento) {
+    return '--'
+  }
+
+  const status = pagamento.statusMercadoPago || pagamento.status
+  const labels = {
+    pending: 'Pendente',
+    approved: 'Aprovado',
+    authorized: 'Autorizado',
+    in_process: 'Em analise',
+    in_mediation: 'Em mediacao',
+    rejected: 'Recusado',
+    cancelled: 'Cancelado',
+    refunded: 'Estornado',
+    charged_back: 'Chargeback',
+    creating: 'Criando pagamento',
+  }
+
+  return labels[status] || status || '--'
+}
+
+function getPagamentoParcelasLabel(pagamento) {
+  const installments = Number(pagamento?.installments || 1)
+  const installmentAmount = Number(pagamento?.installmentAmount || 0)
+
+  if (installments > 1 && installmentAmount > 0) {
+    return `${installments}x de ${formatCurrency(installmentAmount)}`
+  }
+
+  return `${installments}x`
+}
+
 export default function OrdersPage() {
   const { data: orders, loading } = useCollectionData('pedidos')
   const { notify } = useAdminUI()
+  const { user } = useAuthSession()
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState('all')
   const [detailOrder, setDetailOrder] = useState(null)
+  const [consultingPayment, setConsultingPayment] = useState(false)
   const deferredSearch = useDeferredValue(search)
 
   const filteredOrders = useMemo(() => {
@@ -53,6 +178,7 @@ export default function OrdersPage() {
             order.cliente?.email,
             order.id,
             order.status,
+            getFreteLabel(order.frete),
           ].join(' ').toLowerCase()
           if (!haystack.includes(q)) return false
         }
@@ -84,6 +210,30 @@ export default function OrdersPage() {
     }
   }
 
+  async function handleConsultPayment(orderId) {
+    setConsultingPayment(true)
+
+    try {
+      const result = await consultMercadoPagoPayment(user, orderId)
+      notify({
+        type: 'success',
+        title: 'Pagamento consultado',
+        description: `Status: ${getPagamentoStatusLabel(result.pagamento)}`,
+      })
+      if (result.pedido) {
+        setDetailOrder(result.pedido)
+      }
+    } catch (error) {
+      notify({
+        type: 'error',
+        title: 'Falha ao consultar pagamento',
+        description: error.message || 'Tente novamente.',
+      })
+    } finally {
+      setConsultingPayment(false)
+    }
+  }
+
   const columns = [
     {
       key: 'id',
@@ -110,6 +260,26 @@ export default function OrdersPage() {
       key: 'total',
       header: 'Total',
       cell: (order) => <strong className="admin-table-price">{formatCurrency(order.total)}</strong>,
+    },
+    {
+      key: 'frete',
+      header: 'Frete',
+      cell: (order) => (
+        <div className="admin-table-stack">
+          <strong>{getFreteLabel(order.frete)}</strong>
+          <span>{getFretePrazo(order.frete)}</span>
+        </div>
+      ),
+    },
+    {
+      key: 'pagamento',
+      header: 'Pagamento',
+      cell: (order) => (
+        <div className="admin-table-stack">
+          <strong>{getPagamentoMetodoLabel(order.pagamento)}</strong>
+          <span>{getPagamentoStatusLabel(order.pagamento)}</span>
+        </div>
+      ),
     },
     {
       key: 'status',
@@ -197,6 +367,9 @@ export default function OrdersPage() {
               <h4 style={{ margin: '0 0 8px', fontSize: '14px', color: 'var(--admin-muted)' }}>Cliente</h4>
               <p style={{ margin: 0 }}><strong>{detailOrder.cliente?.nome}</strong></p>
               <p style={{ margin: 0 }}>{detailOrder.cliente?.email} &middot; {detailOrder.cliente?.telefone}</p>
+              <p style={{ margin: '4px 0 0', fontSize: '14px', color: 'var(--admin-muted)' }}>
+                {detailOrder.cliente?.tipoDocumento === 'cnpj' ? 'CNPJ' : 'CPF/CNPJ'}: {formatDocumentoCliente(detailOrder.cliente)}
+              </p>
               {detailOrder.cliente?.endereco && (
                 <p style={{ margin: '4px 0 0', fontSize: '14px', color: 'var(--admin-muted)' }}>
                   {detailOrder.cliente.endereco.rua}, {detailOrder.cliente.endereco.numero}
@@ -233,13 +406,126 @@ export default function OrdersPage() {
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', fontSize: '14px' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                <span>Frete ({detailOrder.frete?.tipo})</span>
+                <span>Frete ({getFreteLabel(detailOrder.frete)})</span>
                 <span>{detailOrder.frete?.valor === 0 ? 'Gratis' : formatCurrency(detailOrder.frete?.valor)}</span>
               </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span>Prazo</span>
+                <span>{getFretePrazo(detailOrder.frete)}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span>CEP destino</span>
+                <span>{detailOrder.frete?.cepDestino || detailOrder.cliente?.endereco?.cep || '--'}</span>
+              </div>
+              {detailOrder.frete?.provider === 'melhor_envio' ? (
+                <>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span>Servico</span>
+                    <span>{detailOrder.frete.servicoId || '--'}</span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span>Valor original</span>
+                    <span>{formatCurrency(detailOrder.frete.valorOriginal)}</span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span>Prazo transportadora</span>
+                    <span>{getFretePrazoOriginal(detailOrder.frete)}</span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span>Separacao/embalagem</span>
+                    <span>{detailOrder.frete.diasExtrasPreparacao || 0} dias</span>
+                  </div>
+                  <div className="admin-inline-notice">
+                    Estrutura pronta para futura geracao de etiqueta do Melhor Envio.
+                  </div>
+                </>
+              ) : null}
               <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 700, fontSize: '16px', paddingTop: '8px', borderTop: '2px solid var(--admin-border-strong)' }}>
                 <span>Total</span>
                 <span>{formatCurrency(detailOrder.total)}</span>
               </div>
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', fontSize: '14px' }}>
+              <h4 style={{ margin: 0, fontSize: '14px', color: 'var(--admin-muted)' }}>Pagamento</h4>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span>Metodo</span>
+                <span>{getPagamentoMetodoLabel(detailOrder.pagamento)}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span>Status</span>
+                <span>{getPagamentoStatusLabel(detailOrder.pagamento)}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span>Payment ID</span>
+                <span>{detailOrder.pagamento?.paymentId || '--'}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span>Valor</span>
+                <span>{formatCurrency(detailOrder.pagamento?.valor || 0)}</span>
+              </div>
+              {detailOrder.pagamento?.metodo === 'credit_card' ? (
+                <>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span>Parcelas</span>
+                    <span>{getPagamentoParcelasLabel(detailOrder.pagamento)}</span>
+                  </div>
+                  {detailOrder.pagamento.totalPaidAmount ? (
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span>Total pago</span>
+                      <span>{formatCurrency(detailOrder.pagamento.totalPaidAmount)}</span>
+                    </div>
+                  ) : null}
+                  {detailOrder.pagamento.installmentAmount ? (
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span>Valor da parcela</span>
+                      <span>{formatCurrency(detailOrder.pagamento.installmentAmount)}</span>
+                    </div>
+                  ) : null}
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span>Metodo MP</span>
+                    <span>{detailOrder.pagamento.paymentMethodId || '--'}</span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span>Cartao</span>
+                    <span>
+                      {[detailOrder.pagamento.cardBrand, detailOrder.pagamento.lastFourDigits && `final ${detailOrder.pagamento.lastFourDigits}`]
+                        .filter(Boolean)
+                        .join(' ') || '--'}
+                    </span>
+                  </div>
+                </>
+              ) : null}
+              {detailOrder.pagamento?.metodo === 'debit_card' ? (
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span>Cartao</span>
+                  <span>
+                    {[detailOrder.pagamento.cardBrand, detailOrder.pagamento.lastFourDigits && `final ${detailOrder.pagamento.lastFourDigits}`]
+                      .filter(Boolean)
+                      .join(' ') || '--'}
+                  </span>
+                </div>
+              ) : null}
+              {detailOrder.pagamento?.metodo === 'pix' && detailOrder.pagamento?.copiaECola ? (
+                <div className="admin-inline-notice">
+                  Pix pendente com codigo copia e cola salvo no pedido.
+                </div>
+              ) : null}
+              {detailOrder.pagamento?.eventos?.length ? (
+                <div className="admin-inline-notice">
+                  Historico: {detailOrder.pagamento.eventos.length} evento(s) registrado(s).
+                </div>
+              ) : null}
+              {detailOrder.pagamento?.provider === 'mercado_pago' ? (
+                <button
+                  type="button"
+                  className="admin-btn-secondary"
+                  onClick={() => handleConsultPayment(detailOrder.id)}
+                  disabled={consultingPayment || !detailOrder.pagamento?.paymentId}
+                >
+                  {consultingPayment ? 'Consultando...' : 'Consultar status no Mercado Pago'}
+                </button>
+              ) : null}
             </div>
 
             <div>

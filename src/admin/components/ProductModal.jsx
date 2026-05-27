@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { formatUppercaseText, normalizeUppercaseText, roundCurrencyValue } from '../../shared/formatters.js'
+import { getPrimaryProductCategory, normalizeProductCategories } from '../../shared/productCategories.js'
 import { calcularPrecoVenda } from '../services/custoService.js'
 import {
   generateSuggestedProductDescription,
@@ -22,6 +23,7 @@ const emptyProduct = {
   preco: '',
   precoVenda: '',
   categoria: '',
+  categorias: [],
   setor: '',
   estoque: '',
   codigoProduto: '',
@@ -30,6 +32,10 @@ const emptyProduct = {
   origemProduto: '',
   custoReal: '',
   margemPadrao: '',
+  peso: '',
+  altura: '',
+  largura: '',
+  comprimento: '',
   destaque: false,
   ativo: true,
   imagem: '',
@@ -37,11 +43,24 @@ const emptyProduct = {
 }
 
 const CREATE_NEW_OPTION = '__create-new__'
-const UPPERCASE_FIELDS = new Set(['nome', 'descricao', 'categoria', 'setor', 'codigoProduto', 'ncm', 'cest'])
+const UPPERCASE_FIELDS = new Set(['nome', 'descricao', 'setor', 'codigoProduto', 'ncm', 'cest'])
+
+function parseOptionalNumber(value) {
+  if (value === '' || value === null || value === undefined) {
+    return null
+  }
+
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : null
+}
 
 function hasOption(options, value) {
   const normalizedValue = String(value || '').trim()
   return Boolean(normalizedValue) && options.includes(normalizedValue)
+}
+
+function listUniqueCategories(values) {
+  return normalizeProductCategories(values).sort((first, second) => first.localeCompare(second, 'pt-BR'))
 }
 
 export default function ProductModal({ categories = [], open, product, saving, sectors = [], onClose, onSave }) {
@@ -51,14 +70,10 @@ export default function ProductModal({ categories = [], open, product, saving, s
   const [removeImage, setRemoveImage] = useState(false)
   const [searchModalOpen, setSearchModalOpen] = useState(false)
   const [selectedSearchImage, setSelectedSearchImage] = useState(null)
-  const [categoryMode, setCategoryMode] = useState('select')
+  const [categoryDraft, setCategoryDraft] = useState('')
+  const [categoryError, setCategoryError] = useState('')
   const [sectorMode, setSectorMode] = useState('select')
-  const categoriesRef = useRef(categories)
   const sectorsRef = useRef(sectors)
-
-  useEffect(() => {
-    categoriesRef.current = categories
-  }, [categories])
 
   useEffect(() => {
     sectorsRef.current = sectors
@@ -73,14 +88,19 @@ export default function ProductModal({ categories = [], open, product, saving, s
       ? {
           ...emptyProduct,
           ...product,
+          categorias: normalizeProductCategories(product),
           nome: normalizeUppercaseText(product.nome),
           preco: product.precoVenda ?? product.preco ?? '',
           precoVenda: product.precoVenda ?? product.preco ?? '',
           estoque: product.estoque ?? '',
           custoReal: product.custoReal ?? '',
           margemPadrao: product.margemPadrao ?? '',
+          peso: product.peso ?? '',
+          altura: product.altura ?? '',
+          largura: product.largura ?? '',
+          comprimento: product.comprimento ?? '',
           descricao: normalizeUppercaseText(resolveProductDescription(product)),
-          categoria: normalizeUppercaseText(product.categoria),
+          categoria: getPrimaryProductCategory(product),
           setor: normalizeUppercaseText(product.setor),
           codigoProduto: normalizeUppercaseText(product.codigoProduto),
           ncm: normalizeUppercaseText(product.ncm),
@@ -90,12 +110,13 @@ export default function ProductModal({ categories = [], open, product, saving, s
       : emptyProduct
 
     setForm(nextForm)
+    setCategoryDraft('')
+    setCategoryError('')
     setImageFile(null)
     setPreview(nextForm.imagem || '')
     setRemoveImage(false)
     setSearchModalOpen(false)
     setSelectedSearchImage(null)
-    setCategoryMode(hasOption(categoriesRef.current, nextForm.categoria) || !nextForm.categoria ? 'select' : 'custom')
     setSectorMode(hasOption(sectorsRef.current, nextForm.setor) || !nextForm.setor ? 'select' : 'custom')
   }, [open, product])
 
@@ -152,36 +173,78 @@ export default function ProductModal({ categories = [], open, product, saving, s
   }
 
   function handleSelectFieldChange(field, value) {
-    const isCategoryField = field === 'categoria'
-
     if (value === CREATE_NEW_OPTION) {
-      if (isCategoryField) {
-        setCategoryMode('custom')
-      } else {
-        setSectorMode('custom')
-      }
-
+      setSectorMode('custom')
       updateField(field, '')
       return
     }
 
-    if (isCategoryField) {
-      setCategoryMode('select')
-    } else {
-      setSectorMode('select')
+    setSectorMode('select')
+    updateField(field, value)
+  }
+
+  function toggleCategory(category) {
+    const normalizedCategory = normalizeUppercaseText(category)
+
+    if (!normalizedCategory) {
+      return
     }
 
-    updateField(field, value)
+    setCategoryError('')
+    setForm((current) => {
+      const currentCategories = normalizeProductCategories(current.categorias, current.categoria)
+      const exists = currentCategories.includes(normalizedCategory)
+      const nextCategories = exists
+        ? currentCategories.filter((item) => item !== normalizedCategory)
+        : [...currentCategories, normalizedCategory]
+
+      return {
+        ...current,
+        categoria: nextCategories[0] || '',
+        categorias: nextCategories,
+      }
+    })
+  }
+
+  function addCustomCategory() {
+    const normalizedCategory = normalizeUppercaseText(categoryDraft)
+
+    if (!normalizedCategory) {
+      setCategoryError('Digite uma categoria para adicionar.')
+      return
+    }
+
+    setCategoryDraft('')
+    setCategoryError('')
+    setForm((current) => {
+      const currentCategories = normalizeProductCategories(current.categorias, current.categoria)
+      const nextCategories = currentCategories.includes(normalizedCategory)
+        ? currentCategories
+        : [...currentCategories, normalizedCategory]
+
+      return {
+        ...current,
+        categoria: nextCategories[0] || '',
+        categorias: nextCategories,
+      }
+    })
   }
 
   async function handleSubmit(event) {
     event.preventDefault()
+    const selectedCategories = normalizeProductCategories(form.categorias, form.categoria)
+
+    if (!selectedCategories.length) {
+      setCategoryError('Selecione pelo menos uma categoria.')
+      return
+    }
 
     await onSave({
       ...form,
       nome: normalizeUppercaseText(form.nome),
       descricao: normalizeUppercaseText(resolveProductDescription(form)),
-      categoria: normalizeUppercaseText(form.categoria),
+      categoria: selectedCategories[0],
+      categorias: selectedCategories,
       setor: normalizeUppercaseText(form.setor),
       codigoProduto: normalizeUppercaseText(form.codigoProduto),
       ncm: normalizeUppercaseText(form.ncm),
@@ -192,6 +255,10 @@ export default function ProductModal({ categories = [], open, product, saving, s
       custoReal: form.custoReal === '' ? null : Number(form.custoReal),
       margemPadrao: form.margemPadrao === '' ? null : Number(form.margemPadrao),
       estoque: form.estoque === '' ? null : Number(form.estoque),
+      peso: parseOptionalNumber(form.peso),
+      altura: parseOptionalNumber(form.altura),
+      largura: parseOptionalNumber(form.largura),
+      comprimento: parseOptionalNumber(form.comprimento),
       imageFile,
       selectedSearchImage,
       removeImage,
@@ -200,9 +267,13 @@ export default function ProductModal({ categories = [], open, product, saving, s
 
   const selectedOrigemOption = getOrigemProdutoOption(form.origemProduto)
   const hasCustomOrigemValue = form.origemProduto && !isKnownOrigemProdutoValue(form.origemProduto)
-  const categorySelectValue = categoryMode === 'custom' ? CREATE_NEW_OPTION : form.categoria || ''
   const sectorSelectValue = sectorMode === 'custom' ? CREATE_NEW_OPTION : form.setor || ''
   const suggestedDescription = normalizeUppercaseText(generateSuggestedProductDescription(form))
+  const selectedCategories = normalizeProductCategories(form.categorias, form.categoria)
+  const visibleCategories = useMemo(
+    () => listUniqueCategories([...categories, ...selectedCategories]),
+    [categories, selectedCategories],
+  )
 
   return (
     <Modal
@@ -237,34 +308,44 @@ export default function ProductModal({ categories = [], open, product, saving, s
             </div>
           </label>
 
-          <label className="admin-field">
-            <span>Categoria</span>
-            <select
-              className="admin-select"
-              value={categorySelectValue}
-              onChange={(event) => handleSelectFieldChange('categoria', event.target.value)}
-              required
-            >
-              <option value="">Selecione uma categoria</option>
-              {categories.map((category) => (
-                <option key={category} value={category}>
-                  {formatUppercaseText(category)}
-                </option>
-              ))}
-              <option value={CREATE_NEW_OPTION}>Cadastrar nova categoria</option>
-            </select>
-            {categoryMode === 'custom' ? (
+          <div className="admin-field">
+            <span>Categorias</span>
+            <div className="admin-category-picker" role="group" aria-label="Categorias do produto">
+              {visibleCategories.map((category) => {
+                const selected = selectedCategories.includes(category)
+
+                return (
+                  <button
+                    type="button"
+                    key={category}
+                    className={`admin-category-chip ${selected ? 'is-selected' : ''}`}
+                    onClick={() => toggleCategory(category)}
+                    aria-pressed={selected}
+                  >
+                    {formatUppercaseText(category)}
+                  </button>
+                )
+              })}
+            </div>
+            <div className="admin-field-inline-actions">
               <input
                 className="admin-input"
-                value={form.categoria}
-                onChange={(event) => updateField('categoria', event.target.value)}
-                placeholder="Digite a nova categoria"
-                required
+                value={categoryDraft}
+                onChange={(event) => setCategoryDraft(event.target.value.toLocaleUpperCase('pt-BR'))}
+                placeholder="Cadastrar nova categoria"
               />
+              <button type="button" className="admin-field-link" onClick={addCustomCategory}>
+                Adicionar categoria
+              </button>
+            </div>
+            {categoryError ? (
+              <small className="admin-field-error">{categoryError}</small>
             ) : (
-              <small className="admin-field-hint">Escolha uma categoria existente ou cadastre uma nova.</small>
+              <small className="admin-field-hint">
+                Selecione uma ou mais categorias. A primeira selecionada fica como categoria principal.
+              </small>
             )}
-          </label>
+          </div>
 
           <label className="admin-field">
             <span>Setor</span>
@@ -398,6 +479,65 @@ export default function ProductModal({ categories = [], open, product, saving, s
                 onChange={(event) => updateField('precoVenda', event.target.value)}
                 placeholder="0,00"
                 required
+              />
+            </label>
+          </div>
+
+          <div className="admin-product-logistics-grid admin-field-full">
+            <div className="admin-product-logistics-head">
+              <strong>Logistica</strong>
+              <small>Usado para cotacao de frete. Deixe vazio para usar o padrao da loja.</small>
+            </div>
+
+            <label className="admin-field">
+              <span>Peso (kg)</span>
+              <input
+                className="admin-input"
+                type="number"
+                min="0"
+                step="0.001"
+                value={form.peso}
+                onChange={(event) => updateField('peso', event.target.value)}
+                placeholder="0.300"
+              />
+            </label>
+
+            <label className="admin-field">
+              <span>Altura (cm)</span>
+              <input
+                className="admin-input"
+                type="number"
+                min="0"
+                step="0.1"
+                value={form.altura}
+                onChange={(event) => updateField('altura', event.target.value)}
+                placeholder="10"
+              />
+            </label>
+
+            <label className="admin-field">
+              <span>Largura (cm)</span>
+              <input
+                className="admin-input"
+                type="number"
+                min="0"
+                step="0.1"
+                value={form.largura}
+                onChange={(event) => updateField('largura', event.target.value)}
+                placeholder="15"
+              />
+            </label>
+
+            <label className="admin-field">
+              <span>Comprimento (cm)</span>
+              <input
+                className="admin-input"
+                type="number"
+                min="0"
+                step="0.1"
+                value={form.comprimento}
+                onChange={(event) => updateField('comprimento', event.target.value)}
+                placeholder="20"
               />
             </label>
           </div>

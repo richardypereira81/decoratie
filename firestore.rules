@@ -20,6 +20,11 @@ service cloud.firestore {
       allow write: if isSignedIn();
     }
 
+    match /categorias/{categoriaId} {
+      allow read: if true;
+      allow write: if isSignedIn();
+    }
+
     match /conteudo/{documentId} {
       allow read: if true;
       allow write: if isSignedIn();
@@ -30,8 +35,22 @@ service cloud.firestore {
       allow write: if isSignedIn();
     }
 
+    match /segredos/{documentId} {
+      allow read, write: if false;
+    }
+
     match /leads/{leadId} {
       allow read, write: if isSignedIn();
+    }
+
+    match /notificacoes_estoque/{notificationId} {
+      allow create: if true;
+      allow read, update, delete: if isSignedIn();
+    }
+
+    match /pedidos/{pedidoId} {
+      allow create: if true;
+      allow read, update, delete: if isSignedIn();
     }
 
     match /importacoes/{importacaoId} {
@@ -47,7 +66,7 @@ service cloud.firestore {
     }
 
     match /{document=**} {
-      allow read, write: if isSignedIn();
+      allow read, write: if false;
     }
   }
 }

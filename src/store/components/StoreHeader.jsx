@@ -1,8 +1,8 @@
 import { memo, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { SearchIcon, CartIcon } from './StoreIcons.jsx'
+import { SearchIcon, CartIcon, MenuIcon } from './StoreIcons.jsx'
 
-function StoreHeader({ search, onSearchChange, cartCount, onCartOpen, onHeightChange }) {
+function StoreHeader({ search, onSearchChange, cartCount, onCartOpen, onHeightChange, onMenuOpen }) {
   const [isScrolled, setIsScrolled] = useState(false)
   const headerRef = useRef(null)
 
@@ -49,6 +49,16 @@ function StoreHeader({ search, onSearchChange, cartCount, onCartOpen, onHeightCh
     <header ref={headerRef} className={`store-header ${isScrolled ? 'is-scrolled' : ''}`}>
       <div className="container store-header-shell">
         <div className="store-header-inner">
+          <button
+            type="button"
+            className="store-menu-btn"
+            onClick={onMenuOpen}
+            aria-controls="store-mobile-nav"
+            aria-label="Abrir menu"
+          >
+            <MenuIcon className="store-menu-icon" />
+          </button>
+
           <Link to="/" className="store-logo" aria-label="Decoratie - Ir para a loja">
             <img
               src="/Logo - Decoratie-01.png"
@@ -61,7 +71,7 @@ function StoreHeader({ search, onSearchChange, cartCount, onCartOpen, onHeightCh
             <SearchIcon className="store-search-icon" />
             <input
               type="search"
-              placeholder="Buscar produtos, categorias e colecoes"
+              placeholder="Buscar produtos"
               value={search}
               onChange={(e) => onSearchChange(e.target.value)}
               className="store-search-input"
@@ -80,18 +90,6 @@ function StoreHeader({ search, onSearchChange, cartCount, onCartOpen, onHeightCh
             <span className="store-cart-text">Carrinho</span>
             {cartCount > 0 && <span className="store-cart-badge">{cartCount}</span>}
           </button>
-        </div>
-
-        <div className="store-search store-search-mobile">
-          <SearchIcon className="store-search-icon" />
-          <input
-            type="search"
-            placeholder="Buscar produtos"
-            value={search}
-            onChange={(e) => onSearchChange(e.target.value)}
-            className="store-search-input"
-            aria-label="Buscar produtos"
-          />
         </div>
       </div>
     </header>

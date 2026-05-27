@@ -54,26 +54,6 @@ function QuantitySelector({
       </button>
     </div>
   )
-
-  const sizes = {
-  sm: {
-    height: "28px",
-    fontSize: "12px",
-    buttonSize: "24px"
-  },
-  md: {
-    height: "36px",
-    fontSize: "14px",
-    buttonSize: "32px"
-  },
-  lg: {
-    height: "44px",
-    fontSize: "16px",
-    buttonSize: "40px"
-  }
-}
-
-const s = sizes[size || "md"]
 }
 
 export default memo(QuantitySelector)

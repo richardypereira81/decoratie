@@ -1,15 +1,29 @@
 import { memo } from 'react'
 import { formatCurrency } from '../../shared/formatters.js'
+import { getPrimaryProductCategory } from '../../shared/productCategories.js'
 import { BellIcon, CartIcon } from './StoreIcons.jsx'
 
-function ProductCard({ product, onProductClick }) {
-  const price = product.precoVenda ?? product.preco
+function ProductCard({ product, onProductClick, onAddToCart }) {
+  const price = Number(product.precoVenda ?? product.preco) || 0
+  const originalPrice = Number(product.preco)
+  const hasDiscount = Number.isFinite(originalPrice) && originalPrice > price
   const hasStock = product.estoque === null || product.estoque === undefined || product.estoque > 0
   const imageAlt = product.nome || 'Produto'
-  const description = product.descricao?.trim()
+  const category = getPrimaryProductCategory(product)
 
   function handleOpenProduct() {
     onProductClick(product)
+  }
+
+  function handleAddToCart(event) {
+    event.stopPropagation()
+
+    if (!hasStock || !onAddToCart) {
+      handleOpenProduct()
+      return
+    }
+
+    onAddToCart(product)
   }
 
   return (
@@ -35,25 +49,25 @@ function ProductCard({ product, onProductClick }) {
       </div>
 
       <div className="store-card-body">
-        {product.categoria && (
-          <span className="store-card-category">{product.categoria}</span>
+        {category && (
+          <span className="store-card-category">{category}</span>
         )}
         <h3 className="store-card-name">{product.nome}</h3>
-        {description && <p className="store-card-copy">{description}</p>}
-        <p className="store-card-price">{formatCurrency(price)}</p>
+        <div className="store-card-pricing">
+          {hasDiscount && <span className="store-card-old-price">{formatCurrency(originalPrice)}</span>}
+          <p className="store-card-price">{formatCurrency(price)}</p>
+          {hasStock && <span className="store-card-pix">5% off no Pix</span>}
+        </div>
 
         {hasStock ? (
           <button
             type="button"
             className="store-card-btn store-card-btn-primary"
-            onClick={(event) => {
-              event.stopPropagation()
-              handleOpenProduct()
-            }}
-            aria-label={`Escolher quantidade de ${product.nome}`}
+            onClick={handleAddToCart}
+            aria-label={`Adicionar ${product.nome} ao carrinho`}
           >
             <CartIcon className="store-card-btn-icon" />
-            Escolher quantidade
+            Adicionar
           </button>
         ) : (
           <button
@@ -66,7 +80,7 @@ function ProductCard({ product, onProductClick }) {
             aria-label={`Ver disponibilidade de ${product.nome}`}
           >
             <BellIcon className="store-card-btn-icon" />
-            Ver disponibilidade
+            Avise-me
           </button>
         )}
       </div>
