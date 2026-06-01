@@ -9,6 +9,7 @@ import {
   createMercadoPagoPayment,
   getMercadoPagoPublicConfig,
 } from '../../shared/paymentApi.js'
+import { notifyNewOrder } from '../../shared/orderNotificationApi.js'
 import { ArrowLeftIcon, CheckIcon, TruckIcon, MapPinIcon } from '../components/StoreIcons.jsx'
 import '../store.css'
 
@@ -109,6 +110,24 @@ const emptyCardForm = {
 
 function getDigits(value) {
   return String(value || '').replace(/\D/g, '')
+}
+
+function createOrderNotificationToken() {
+  if (window.crypto?.randomUUID) {
+    return window.crypto.randomUUID()
+  }
+
+  const randomPart = Math.random().toString(36).slice(2)
+  return `${Date.now().toString(36)}-${randomPart}`
+}
+
+function triggerOrderNotification(pedidoId, notificationToken) {
+  notifyNewOrder({ pedidoId, notificationToken }).catch((error) => {
+    console.warn('[pedido] notificacao de novo pedido falhou', {
+      pedidoId,
+      message: error.message,
+    })
+  })
 }
 
 function formatCpfCnpj(value) {
@@ -1360,6 +1379,7 @@ export default function CheckoutPage() {
 
       const frete = buildFreightPayload(selectedShipping, getDigits(form.cep))
       const documentoLimpo = getDigits(form.documento)
+      const notificationToken = createOrderNotificationToken()
       const orderId = await createOrder({
         cliente: {
           nome: form.nome.trim(),
@@ -1396,6 +1416,7 @@ export default function CheckoutPage() {
           valor: total,
           createdAt: new Date().toISOString(),
         } : null,
+        notificationToken,
       })
 
       if (!orderId) {
@@ -1404,6 +1425,7 @@ export default function CheckoutPage() {
       }
 
       if (!mercadoPagoActive) {
+        triggerOrderNotification(orderId, notificationToken)
         clearCart()
         setOrderComplete({ id: orderId, status: 'pendente', pagamento: null })
         return
@@ -1424,6 +1446,7 @@ export default function CheckoutPage() {
       }
 
       clearCart()
+      triggerOrderNotification(orderId, notificationToken)
       setOrderComplete({
         id: orderId,
         status: paymentResult.pedidoStatus,

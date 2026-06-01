@@ -1,4 +1,5 @@
 import { startTransition, useCallback, useEffect, useMemo, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { useCart } from '../hooks/useCart.js'
 import { useProducts } from '../hooks/useProducts.js'
 import { useStoreSettings } from '../hooks/useStoreSettings.js'
@@ -12,10 +13,19 @@ import NotifyModal from '../components/NotifyModal.jsx'
 import ProductModal from '../components/ProductModal.jsx'
 import '../store.css'
 
+function buildProductShareUrl(productId) {
+  const url = new URL(window.location.href)
+  url.pathname = '/'
+  url.searchParams.set('produto', productId)
+  return url.toString()
+}
+
 export default function StorePage() {
+  const [urlSearchParams, setUrlSearchParams] = useSearchParams()
   const { items, addItem, removeItem, updateQuantity, totalItems, totalPrice } = useCart()
   const { data: storeSettings } = useStoreSettings()
   const {
+    products,
     filteredProducts,
     categories,
     loading,
@@ -34,6 +44,7 @@ export default function StorePage() {
   const [activeProduct, setActiveProduct] = useState(null)
   const [notifyProduct, setNotifyProduct] = useState(null)
   const [selectedQuantity, setSelectedQuantity] = useState(1)
+  const sharedProductId = urlSearchParams.get('produto')
 
   useEffect(() => {
     document.title = 'Decoratie - Loja'
@@ -71,6 +82,20 @@ export default function StorePage() {
     return () => window.clearTimeout(timerId)
   }, [addedItemName])
 
+  useEffect(() => {
+    if (loading || !sharedProductId) {
+      return
+    }
+
+    const product = products.find((item) => String(item.id) === sharedProductId)
+
+    if (product && activeProduct?.id !== product.id) {
+      setCartOpen(false)
+      setSelectedQuantity(1)
+      setActiveProduct(product)
+    }
+  }, [activeProduct?.id, loading, products, sharedProductId])
+
   const activeFilterCount = Number(category !== 'all') + Number(sort !== 'default')
   const whatsappUrl = useMemo(
     () => getWhatsAppUrlFromSettings(storeSettings),
@@ -79,6 +104,10 @@ export default function StorePage() {
   const pageStyle = useMemo(
     () => ({ '--store-header-offset': `${headerHeight}px` }),
     [headerHeight]
+  )
+  const activeProductShareUrl = useMemo(
+    () => (activeProduct?.id ? buildProductShareUrl(activeProduct.id) : ''),
+    [activeProduct?.id]
   )
 
   const catalogTitle = useMemo(() => {
@@ -129,11 +158,24 @@ export default function StorePage() {
     setCartOpen(true)
   }, [])
 
+  const syncProductUrl = useCallback((productId, { replace = false } = {}) => {
+    const nextParams = new URLSearchParams(window.location.search)
+
+    if (productId) {
+      nextParams.set('produto', productId)
+    } else {
+      nextParams.delete('produto')
+    }
+
+    setUrlSearchParams(nextParams, { replace })
+  }, [setUrlSearchParams])
+
   const handleOpenProduct = useCallback((product) => {
     setCartOpen(false)
     setSelectedQuantity(1)
     setActiveProduct(product)
-  }, [])
+    syncProductUrl(product.id)
+  }, [syncProductUrl])
 
   const handleHeaderHeightChange = useCallback((value) => {
     setHeaderHeight((current) => (current === value ? current : value))
@@ -144,18 +186,21 @@ export default function StorePage() {
     setAddedItemName(product.nome || 'Produto')
     setActiveProduct(null)
     setSelectedQuantity(1)
-  }, [addItem])
+    syncProductUrl(null, { replace: true })
+  }, [addItem, syncProductUrl])
 
   const handleCloseProductModal = useCallback(() => {
     setActiveProduct(null)
     setSelectedQuantity(1)
-  }, [])
+    syncProductUrl(null, { replace: true })
+  }, [syncProductUrl])
 
   const handleNotifyRequest = useCallback((product) => {
     setActiveProduct(null)
     setNotifyProduct(product)
     setSelectedQuantity(1)
-  }, [])
+    syncProductUrl(null, { replace: true })
+  }, [syncProductUrl])
 
   if (loading) {
     return (
@@ -251,6 +296,7 @@ export default function StorePage() {
         onClose={handleCloseProductModal}
         onAddToCart={handleAddToCart}
         onNotifyRequest={handleNotifyRequest}
+        productShareUrl={activeProductShareUrl}
       />
 
       <NotifyModal

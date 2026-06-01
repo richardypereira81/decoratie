@@ -19,6 +19,7 @@ const FREIGHT_ERROR_MESSAGES = {
   api_melhor_envio_validacao: 'O Melhor Envio recusou os dados enviados. Revise CEP, peso, dimensoes e modalidades.',
   endpoint_melhor_envio: 'Endpoint do Melhor Envio nao encontrado para a configuracao atual.',
   melhor_envio_nao_conectado: 'Melhor Envio nao conectado. Conecte pelo painel admin.',
+  me_etiqueta_ausente: 'Este pedido ainda nao possui etiqueta gerada no Melhor Envio.',
   oauth_ambiente_incorreto: 'Token invalido para o ambiente selecionado. Reconecte usando o ambiente correto.',
   oauth_autorizacao_negada: 'Autorizacao do Melhor Envio cancelada ou negada.',
   oauth_callback_invalido: 'Retorno do Melhor Envio invalido. Inicie a conexao novamente.',
@@ -199,4 +200,57 @@ export async function disconnectMelhorEnvioOAuth(user) {
     method: 'POST',
     token,
   })
+}
+
+export async function fetchMelhorEnvioOrderLabel(user, pedidoId) {
+  const token = await getAdminToken(user)
+  const response = await fetch(`/api/admin/pedidos/${pedidoId}/etiqueta-melhor-envio`, {
+    headers: {
+      Accept: 'application/pdf, application/json',
+      Authorization: `Bearer ${token}`,
+    },
+  })
+  const contentType = response.headers.get('content-type') || ''
+
+  if (contentType.includes('application/json')) {
+    let data = null
+
+    try {
+      data = await response.json()
+    } catch {
+      data = null
+    }
+
+    if (response.ok) {
+      const url = data?.url || data?.link || data?.file || data?.downloadUrl
+
+      if (url) {
+        return {
+          url,
+          contentType,
+          filename: `etiqueta-melhor-envio-${pedidoId}.pdf`,
+        }
+      }
+    }
+
+    throw createFreightError(getStatusMessage(response, data), {
+      code: data?.code || `http_${response.status}`,
+      details: data?.details || null,
+    })
+  }
+
+  if (!response.ok) {
+    throw createFreightError(getStatusMessage(response, null), {
+      code: `http_${response.status}`,
+    })
+  }
+
+  const contentDisposition = response.headers.get('content-disposition') || ''
+  const filenameMatch = contentDisposition.match(/filename="([^"]+)"/i)
+
+  return {
+    blob: await response.blob(),
+    contentType,
+    filename: filenameMatch?.[1] || `etiqueta-melhor-envio-${pedidoId}.pdf`,
+  }
 }

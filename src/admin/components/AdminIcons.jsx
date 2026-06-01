@@ -165,6 +165,36 @@ export function EyeIcon(props) {
   )
 }
 
+export function PrinterIcon(props) {
+  return (
+    <IconBase {...props}>
+      <path d="M6 9V3h12v6" />
+      <path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2" />
+      <path d="M6 14h12v7H6z" />
+      <path d="M8 17h8" />
+    </IconBase>
+  )
+}
+
+export function SendIcon(props) {
+  return (
+    <IconBase {...props}>
+      <path d="M22 2 11 13" />
+      <path d="m22 2-7 20-4-9-9-4 20-7Z" />
+    </IconBase>
+  )
+}
+
+export function MessageCircleIcon(props) {
+  return (
+    <IconBase {...props}>
+      <path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 8.8 8.8 0 0 1-3.7-.8L3 21l1.8-5.1A8.4 8.4 0 1 1 21 11.5Z" />
+      <path d="M8 10h8" />
+      <path d="M8 14h5" />
+    </IconBase>
+  )
+}
+
 export function MenuIcon(props) {
   return (
     <IconBase {...props}>

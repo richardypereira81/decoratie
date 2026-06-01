@@ -6,6 +6,7 @@ const Busboy = require("busboy");
 const {XMLParser} = require("fast-xml-parser");
 const {stringify} = require("csv-stringify/sync");
 const ExcelJS = require("exceljs");
+const PDFDocument = require("pdfkit");
 const functions = require("firebase-functions/v1");
 
 if (!admin.apps.length) {
@@ -232,6 +233,19 @@ const DEFAULT_PAGAMENTOS_CONFIG = {
     updatedBy: null,
   },
 };
+
+const DEFAULT_ORDER_NOTIFICATIONS_CONFIG = {
+  email: {
+    ativo: false,
+    destino: "",
+  },
+  whatsapp: {
+    ativo: false,
+    destino: "",
+  },
+};
+
+const ORDER_NOTIFICATION_LOCK_TTL_MS = 2 * 60 * 1000;
 
 const MELHOR_ENVIO_OAUTH_SCOPES = [
   "shipping-calculate",
@@ -619,6 +633,153 @@ function getFunctionsConfig(path) {
     return path.split(".").reduce((acc, key) => acc?.[key], config);
   } catch (error) {
     return undefined;
+  }
+}
+
+function getEnvValue(name, configPath = "") {
+  return String(
+      process.env[name] ||
+      (configPath ? getFunctionsConfig(configPath) : "") ||
+      "",
+  ).trim();
+}
+
+function normalizeNotificationEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function normalizeNotificationPhone(value) {
+  const digits = onlyDigits(value);
+
+  if (digits.length === 10 || digits.length === 11) {
+    return `55${digits}`;
+  }
+
+  if (digits.startsWith("55") && (digits.length === 12 || digits.length === 13)) {
+    return digits;
+  }
+
+  return digits;
+}
+
+function isNotificationPhoneReady(value) {
+  const phone = normalizeNotificationPhone(value);
+  return phone.length === 12 || phone.length === 13;
+}
+
+function normalizeOrderNotificationConfig(data = {}) {
+  const source = isPlainObject(data.notificacoesPedido) ?
+    data.notificacoesPedido :
+    data;
+  const email = isPlainObject(source.email) ? source.email : {};
+  const whatsapp = isPlainObject(source.whatsapp) ? source.whatsapp : {};
+
+  return {
+    email: {
+      ativo: Boolean(email.ativo),
+      destino: normalizeNotificationEmail(email.destino),
+    },
+    whatsapp: {
+      ativo: Boolean(whatsapp.ativo),
+      destino: normalizeNotificationPhone(whatsapp.destino),
+    },
+    updatedAt: toIsoString(source.updatedAt) || null,
+    updatedBy: String(source.updatedBy || "").trim() || null,
+  };
+}
+
+function getEmailNotificationProviderConfig() {
+  const resendApiKey = getEnvValue(
+      "ORDER_NOTIFICATION_RESEND_API_KEY",
+      "notificacoes_pedido.resend_api_key",
+  ) || getEnvValue("RESEND_API_KEY", "resend.api_key");
+  const from = getEnvValue(
+      "ORDER_NOTIFICATION_EMAIL_FROM",
+      "notificacoes_pedido.email_from",
+  );
+  const webhookUrl = getEnvValue(
+      "ORDER_NOTIFICATION_EMAIL_WEBHOOK_URL",
+      "notificacoes_pedido.email_webhook_url",
+  );
+
+  return {
+    resendApiKey,
+    from,
+    webhookUrl,
+    configured: Boolean(webhookUrl || (resendApiKey && from)),
+  };
+}
+
+function getWhatsappNotificationProviderConfig() {
+  const webhookUrl = getEnvValue(
+      "ORDER_NOTIFICATION_WHATSAPP_WEBHOOK_URL",
+      "notificacoes_pedido.whatsapp_webhook_url",
+  );
+  const accessToken = getEnvValue(
+      "ORDER_NOTIFICATION_WHATSAPP_ACCESS_TOKEN",
+      "notificacoes_pedido.whatsapp_access_token",
+  ) || getEnvValue("WHATSAPP_CLOUD_ACCESS_TOKEN", "whatsapp.access_token");
+  const phoneNumberId = getEnvValue(
+      "ORDER_NOTIFICATION_WHATSAPP_PHONE_NUMBER_ID",
+      "notificacoes_pedido.whatsapp_phone_number_id",
+  ) || getEnvValue("WHATSAPP_CLOUD_PHONE_NUMBER_ID", "whatsapp.phone_number_id");
+  const apiVersion = getEnvValue(
+      "ORDER_NOTIFICATION_WHATSAPP_API_VERSION",
+      "notificacoes_pedido.whatsapp_api_version",
+  ) || "v20.0";
+
+  return {
+    webhookUrl,
+    accessToken,
+    phoneNumberId,
+    apiVersion,
+    configured: Boolean(webhookUrl || (accessToken && phoneNumberId)),
+  };
+}
+
+function sanitizeOrderNotificationConfigForAdmin(config) {
+  return {
+    ...config,
+    status: {
+      emailProviderConfigured: getEmailNotificationProviderConfig().configured,
+      whatsappProviderConfigured: getWhatsappNotificationProviderConfig().configured,
+    },
+  };
+}
+
+async function loadOrderNotificationConfig() {
+  const snapshot = await db.collection("segredos")
+      .doc("notificacoes_pedido")
+      .get();
+
+  if (!snapshot.exists) {
+    return normalizeOrderNotificationConfig(DEFAULT_ORDER_NOTIFICATIONS_CONFIG);
+  }
+
+  return normalizeOrderNotificationConfig(snapshot.data());
+}
+
+function validateOrderNotificationConfig(config) {
+  if (
+    config.email.ativo &&
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(config.email.destino)
+  ) {
+    throw createHttpError(
+        422,
+        "notificacao_email_invalido",
+        "Informe um e-mail de destino valido.",
+    );
+  }
+
+  if (
+    config.whatsapp.ativo &&
+    !(config.whatsapp.destino.length === 12 || config.whatsapp.destino.length === 13)
+  ) {
+    throw createHttpError(
+        422,
+        "notificacao_whatsapp_invalido",
+        "Informe um WhatsApp de destino valido.",
+    );
   }
 }
 
@@ -1088,6 +1249,84 @@ async function melhorEnvioRequest({config, token, path, method = "GET", body = n
   }
 }
 
+async function melhorEnvioFileRequest({
+  config,
+  token,
+  path,
+  method = "GET",
+  body = null,
+  accept = "application/pdf",
+}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+  const cleanToken = normalizeMelhorEnvioToken(token);
+
+  if (!cleanToken) {
+    throw createHttpError(
+        409,
+        "token_nao_configurado",
+        "Token do Melhor Envio nao configurado.",
+    );
+  }
+
+  try {
+    const response = await fetch(`${getMelhorEnvioBaseUrl(config)}${path}`, {
+      method,
+      signal: controller.signal,
+      headers: {
+        "Accept": accept,
+        "Authorization": `Bearer ${cleanToken}`,
+        "Content-Type": "application/json",
+        "User-Agent": getMelhorEnvioUserAgent(config),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const contentType = response.headers.get("content-type") || accept;
+    const buffer = Buffer.from(await response.arrayBuffer());
+
+    if (!response.ok) {
+      const text = buffer.toString("utf8");
+      let data = text;
+
+      if (contentType.includes("application/json") && text) {
+        try {
+          data = JSON.parse(text);
+        } catch (error) {
+          data = {raw: text};
+        }
+      }
+
+      throw createMelhorEnvioResponseError(response, data, config, path);
+    }
+
+    return {
+      buffer,
+      contentType,
+    };
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw createHttpError(
+          504,
+          "timeout_melhor_envio",
+          "A consulta ao Melhor Envio excedeu o tempo limite.",
+      );
+    }
+
+    if (error.statusCode) {
+      throw error;
+    }
+
+    throw createHttpError(
+        502,
+        "api_indisponivel",
+        "Melhor Envio indisponivel no momento.",
+        error.message,
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function isMelhorEnvioAuthError(error) {
   return [
     "token_invalido",
@@ -1244,6 +1483,34 @@ async function melhorEnvioAuthenticatedRequest({
       path,
       method,
       body,
+    });
+  }
+}
+
+async function melhorEnvioAuthenticatedFileRequest({
+  config,
+  path,
+  method = "GET",
+  body = null,
+  accept = "application/pdf",
+}) {
+  const token = await getValidMelhorEnvioAccessToken(config);
+
+  try {
+    return await melhorEnvioFileRequest({config, token, path, method, body, accept});
+  } catch (error) {
+    if (!isMelhorEnvioAuthError(error)) {
+      throw error;
+    }
+
+    const refreshedToken = await refreshMelhorEnvioAccessToken(config, "api_401");
+    return melhorEnvioFileRequest({
+      config,
+      token: refreshedToken,
+      path,
+      method,
+      body,
+      accept,
     });
   }
 }
@@ -1983,6 +2250,1505 @@ async function verifyAdminRequest(req, res, next) {
   }
 }
 
+function getOrderNotificationBaseUrl(req) {
+  const configuredUrl = getEnvValue(
+      "APP_PUBLIC_URL",
+      "app.public_url",
+  ) || getEnvValue(
+      "ORDER_NOTIFICATION_PUBLIC_URL",
+      "notificacoes_pedido.public_url",
+  );
+
+  if (configuredUrl) {
+    return configuredUrl.replace(/\/+$/g, "");
+  }
+
+  const origin = String(req.get("origin") || "").trim();
+  if (origin) {
+    return origin.replace(/\/+$/g, "");
+  }
+
+  const proto = String(req.get("x-forwarded-proto") || req.protocol || "https")
+      .split(",")[0]
+      .trim();
+  const host = String(req.get("x-forwarded-host") || req.get("host") || "")
+      .split(",")[0]
+      .trim();
+
+  return host ? `${proto}://${host}` : "";
+}
+
+function buildOrderAdminUrl(req, pedidoId) {
+  const baseUrl = getOrderNotificationBaseUrl(req);
+
+  if (!baseUrl) {
+    return "";
+  }
+
+  const url = new URL("/admin/pedidos", baseUrl);
+  url.searchParams.set("pedido", pedidoId);
+  return url.toString();
+}
+
+function formatNotificationCurrency(value) {
+  return new Intl.NumberFormat("pt-BR", {
+    style: "currency",
+    currency: "BRL",
+  }).format(toNumber(value));
+}
+
+function getOrderEntregaRetiradaLabel(frete = null) {
+  if (!frete) {
+    return "Não informado";
+  }
+
+  if (frete.provider === "retirada_local" || frete.tipo === "retirada") {
+    return frete.modalidade || frete.titulo || "Retirada";
+  }
+
+  if (frete.provider === "a_combinar" || frete.tipo === "a_combinar") {
+    return frete.modalidade || "Entrega a combinar";
+  }
+
+  return [frete.transportadora, frete.modalidade]
+      .filter(Boolean)
+      .join(" ") || "Entrega";
+}
+
+function getOrderPaymentLabel(pagamento = null) {
+  if (!pagamento) {
+    return "Não informado";
+  }
+
+  const labels = {
+    pix: "Pix",
+    credit_card: "Cartão de crédito",
+    debit_card: "Cartão de débito",
+  };
+
+  return labels[pagamento.metodo] ||
+    pagamento.metodo ||
+    pagamento.provider ||
+    "Não informado";
+}
+
+function normalizeOrderStatusForCreate(value) {
+  const status = String(value || "").trim();
+  const allowed = new Set([
+    "pendente",
+    "aguardando_pagamento",
+    "pagamento_pendente",
+    "pagamento_recusado",
+    "pago",
+    "enviado",
+    "entregue",
+    "cancelado",
+  ]);
+
+  return allowed.has(status) ? status : "pendente";
+}
+
+function normalizeOrderCustomerForCreate(value = {}) {
+  if (!isPlainObject(value)) {
+    throw createHttpError(
+        422,
+        "pedido_cliente_invalido",
+        "Informe os dados do cliente para criar o pedido.",
+    );
+  }
+
+  const endereco = isPlainObject(value.endereco) ? value.endereco : {};
+
+  return {
+    nome: String(value.nome || "").trim(),
+    email: String(value.email || "").trim().toLowerCase(),
+    telefone: String(value.telefone || "").trim(),
+    documento: String(value.documento || "").trim(),
+    documentoLimpo: onlyDigits(value.documentoLimpo || value.documento),
+    tipoDocumento: String(value.tipoDocumento || "").trim(),
+    endereco: {
+      cep: String(endereco.cep || "").trim(),
+      rua: String(endereco.rua || "").trim(),
+      numero: String(endereco.numero || "").trim(),
+      complemento: String(endereco.complemento || "").trim(),
+      bairro: String(endereco.bairro || "").trim(),
+      cidade: String(endereco.cidade || "").trim(),
+      estado: String(endereco.estado || "").trim(),
+    },
+  };
+}
+
+function normalizeOrderItemsForCreate(value = []) {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw createHttpError(
+        422,
+        "pedido_sem_itens",
+        "Inclua ao menos um produto no pedido.",
+    );
+  }
+
+  return value.map((item) => {
+    const quantity = Math.max(1, Number.parseInt(item?.quantidade, 10) || 1);
+    const price = round2(item?.preco);
+
+    if (!Number.isFinite(price) || price < 0) {
+      throw createHttpError(
+          422,
+          "pedido_item_invalido",
+          "Um produto do pedido possui preco invalido.",
+          {produtoId: item?.produtoId || null},
+      );
+    }
+
+    return {
+      produtoId: String(item?.produtoId || "").trim(),
+      nome: String(item?.nome || "Produto").trim(),
+      preco: price,
+      quantidade: quantity,
+      imagem: String(item?.imagem || "").trim(),
+    };
+  });
+}
+
+function normalizeOrderPayloadForCreate(data = {}) {
+  const subtotal = round2(data.subtotal);
+  const total = round2(data.total);
+
+  if (!Number.isFinite(total) || total < 0) {
+    throw createHttpError(
+        422,
+        "pedido_total_invalido",
+        "O total do pedido e invalido.",
+    );
+  }
+
+  return {
+    cliente: normalizeOrderCustomerForCreate(data.cliente),
+    itens: normalizeOrderItemsForCreate(data.itens),
+    frete: isPlainObject(data.frete) ? data.frete : null,
+    subtotal: Number.isFinite(subtotal) ? subtotal : 0,
+    total,
+    status: normalizeOrderStatusForCreate(data.status),
+    pagamento: isPlainObject(data.pagamento) ? data.pagamento : null,
+    notificationToken: String(data.notificationToken || "").trim(),
+    notificationEmailSent: false,
+    notificationWhatsappSent: false,
+    notificationError: "",
+    notificationSentAt: null,
+  };
+}
+
+async function createOrderWithSequence(orderPayload) {
+  const counterRef = db.collection("counters").doc("orders");
+  const orderRef = db.collection("pedidos").doc();
+  const initialCounterValue = await getInitialOrderCounterValue();
+  let orderNumber = 0;
+
+  await db.runTransaction(async (transaction) => {
+    const counterSnapshot = await transaction.get(counterRef);
+    const lastNumber = Number(
+        counterSnapshot.exists ?
+          counterSnapshot.data()?.lastNumber || 0 :
+          initialCounterValue,
+    );
+
+    orderNumber = Number.isFinite(lastNumber) && lastNumber > 0 ?
+      Math.floor(lastNumber) + 1 :
+      1;
+
+    transaction.set(counterRef, {
+      lastNumber: orderNumber,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, {merge: true});
+
+    transaction.set(orderRef, {
+      ...orderPayload,
+      orderNumber,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  });
+
+  return {
+    id: orderRef.id,
+    orderNumber,
+  };
+}
+
+function getMelhorEnvioOrderIdFromOrder(order = {}) {
+  const frete = isPlainObject(order.frete) ? order.frete : {};
+  const melhorEnvio = isPlainObject(order.melhorEnvio) ? order.melhorEnvio : {};
+  const etiqueta = isPlainObject(frete.etiqueta) ? frete.etiqueta : {};
+  const candidates = [
+    frete.melhorEnvioOrderId,
+    frete.melhorEnvioId,
+    frete.orderId,
+    frete.order_id,
+    frete.etiquetaId,
+    frete.codigoEtiqueta,
+    frete.shipmentOrderId,
+    etiqueta.id,
+    etiqueta.orderId,
+    melhorEnvio.orderId,
+    melhorEnvio.id,
+    order.melhorEnvioOrderId,
+    order.etiquetaMelhorEnvioId,
+  ];
+
+  for (const candidate of candidates) {
+    const value = String(candidate || "").trim();
+
+    if (value) {
+      return value;
+    }
+  }
+
+  return "";
+}
+
+function getValidOrderNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? Math.floor(number) : null;
+}
+
+async function getInitialOrderCounterValue() {
+  const snapshot = await db.collection("pedidos").select("orderNumber").get();
+  let totalOrders = 0;
+  let maxOrderNumber = 0;
+
+  snapshot.forEach((docSnapshot) => {
+    totalOrders += 1;
+    maxOrderNumber = Math.max(
+        maxOrderNumber,
+        getValidOrderNumber(docSnapshot.data()?.orderNumber) || 0,
+    );
+  });
+
+  return Math.max(totalOrders, maxOrderNumber);
+}
+
+async function normalizeExistingOrderNumbers() {
+  const snapshot = await db.collection("pedidos").get();
+  const orders = snapshot.docs
+      .map((docSnapshot) => ({
+        ref: docSnapshot.ref,
+        id: docSnapshot.id,
+        data: docSnapshot.data() || {},
+      }))
+      .sort((a, b) => {
+        const dateA = toDate(a.data.createdAt)?.getTime() || 0;
+        const dateB = toDate(b.data.createdAt)?.getTime() || 0;
+
+        if (dateA !== dateB) {
+          return dateA - dateB;
+        }
+
+        return a.id.localeCompare(b.id);
+      });
+  const usedNumbers = new Set();
+  let nextNumber = 1;
+  let updated = 0;
+  let batch = db.batch();
+  let operations = 0;
+
+  orders.forEach((order) => {
+    const existingNumber = getValidOrderNumber(order.data.orderNumber);
+
+    if (existingNumber) {
+      usedNumbers.add(existingNumber);
+    }
+  });
+
+  for (const order of orders) {
+    if (getValidOrderNumber(order.data.orderNumber)) {
+      continue;
+    }
+
+    while (usedNumbers.has(nextNumber)) {
+      nextNumber += 1;
+    }
+
+    usedNumbers.add(nextNumber);
+    batch.set(order.ref, {
+      orderNumber: nextNumber,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, {merge: true});
+    updated += 1;
+    operations += 1;
+    nextNumber += 1;
+
+    if (operations >= 450) {
+      await batch.commit();
+      batch = db.batch();
+      operations = 0;
+    }
+  }
+
+  const lastNumber = Math.max(...Array.from(usedNumbers), orders.length, 0);
+  batch.set(db.collection("counters").doc("orders"), {
+    lastNumber,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, {merge: true});
+  operations += 1;
+
+  if (operations > 0) {
+    await batch.commit();
+  }
+
+  return {
+    total: orders.length,
+    updated,
+    lastNumber,
+  };
+}
+
+function formatOrderAddress(endereco = null) {
+  if (!isPlainObject(endereco)) {
+    return "";
+  }
+
+  const line1 = [
+    endereco.rua,
+    endereco.numero,
+    endereco.complemento,
+  ].filter(Boolean).join(", ");
+  const line2 = [
+    endereco.bairro,
+    endereco.cidade && endereco.estado ?
+      `${endereco.cidade}/${endereco.estado}` :
+      endereco.cidade || endereco.estado,
+  ].filter(Boolean).join(" - ");
+  const cep = endereco.cep ? `CEP: ${endereco.cep}` : "";
+
+  return [line1, line2, cep].filter(Boolean).join(" | ");
+}
+
+function formatOrderReportDate(value) {
+  let date = null;
+
+  if (value instanceof Date) {
+    date = value;
+  } else if (typeof value?.toDate === "function") {
+    date = value.toDate();
+  } else if (Number.isFinite(value?.seconds)) {
+    date = new Date(value.seconds * 1000);
+  } else if (Number.isFinite(value?._seconds)) {
+    date = new Date(value._seconds * 1000);
+  } else if (value) {
+    const parsed = new Date(value);
+    date = Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+
+  if (!date) {
+    return "--";
+  }
+
+  return new Intl.DateTimeFormat("pt-BR", {
+    dateStyle: "short",
+    timeStyle: "short",
+    timeZone: "America/Sao_Paulo",
+  }).format(date);
+}
+
+function formatOrderReportDateInput(value) {
+  const [year, month, day] = String(value || "")
+      .split("-")
+      .map((part) => Number(part));
+
+  if (!year || !month || !day) {
+    return "";
+  }
+
+  return new Intl.DateTimeFormat("pt-BR", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+  }).format(new Date(year, month - 1, day));
+}
+
+function getOrderReportPickupSchedule(frete = {}) {
+  const schedule = isPlainObject(frete.agendamentoRetirada) ?
+    frete.agendamentoRetirada :
+    isPlainObject(frete.retiradaAgendada) ? frete.retiradaAgendada : {};
+
+  return {
+    data: String(schedule.data || schedule.date || frete.dataRetirada || "").trim(),
+    hora: String(schedule.hora || schedule.time || frete.horaRetirada || "").trim(),
+    texto: String(schedule.texto || schedule.label || "").trim(),
+  };
+}
+
+function getOrderReportDeadlineLabel(frete = {}) {
+  const isPickup = frete.provider === "retirada_local" || frete.tipo === "retirada";
+
+  if (isPickup) {
+    const schedule = getOrderReportPickupSchedule(frete);
+    const dateLabel = formatOrderReportDateInput(schedule.data);
+
+    if (dateLabel && schedule.hora) {
+      return `${dateLabel} as ${schedule.hora}`;
+    }
+
+    if (dateLabel) {
+      return dateLabel;
+    }
+
+    const text = schedule.texto || frete.prazoTexto || frete.prazo || "";
+    return String(text).replace(/^retirada\s+agendada:\s*/i, "").trim() || "--";
+  }
+
+  return frete.prazoTexto || frete.prazoFinalCliente || frete.prazo || "--";
+}
+
+function getOrderReportStatusLabel(status) {
+  const labels = {
+    pendente: "Pendente",
+    aguardando_pagamento: "Aguardando pagamento",
+    pagamento_pendente: "Pagamento pendente",
+    pagamento_recusado: "Pagamento recusado",
+    pago: "Pago",
+    enviado: "Enviado",
+    entregue: "Entregue",
+    cancelado: "Cancelado",
+  };
+
+  return labels[status] || status || "--";
+}
+
+function getOrderReportPaymentStatusLabel(pagamento = null) {
+  if (!pagamento) {
+    return "--";
+  }
+
+  const status = pagamento.statusMercadoPago || pagamento.status;
+  const labels = {
+    pending: "Pendente",
+    approved: "Aprovado",
+    authorized: "Autorizado",
+    in_process: "Em analise",
+    in_mediation: "Em mediacao",
+    rejected: "Recusado",
+    cancelled: "Cancelado",
+    refunded: "Estornado",
+    charged_back: "Chargeback",
+    creating: "Criando pagamento",
+  };
+
+  return labels[status] || status || "--";
+}
+
+function getOrderReportPaymentAuthorizationCode(pagamento = null) {
+  return String(
+      pagamento?.authorizationCode ||
+      pagamento?.authorization_code ||
+      pagamento?.codigoAutorizacao ||
+      pagamento?.transactionAuthorizationCode ||
+      "",
+  ).trim();
+}
+
+function getOrderReportPaymentLabel(pagamento = null) {
+  if (!pagamento) {
+    return "--";
+  }
+
+  const labels = {
+    pix: "Pix",
+    credit_card: "Cartao de credito",
+    debit_card: "Cartao de debito",
+  };
+
+  return labels[pagamento.metodo] ||
+    pagamento.metodo ||
+    pagamento.provider ||
+    "--";
+}
+
+function getOrderReportCode({pedidoId, order}) {
+  const orderNumber = getValidOrderNumber(order?.orderNumber);
+  return orderNumber ? String(orderNumber) : String(pedidoId || "");
+}
+
+function getOrderReportItems(order = {}) {
+  return Array.isArray(order.itens) ? order.itens : [];
+}
+
+function buildOrderReportPdfBuffer({pedidoId, order}) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    const doc = new PDFDocument({
+      size: "A4",
+      margin: 32,
+      info: {
+        Title: `Decoratie - Pedido ${getOrderReportCode({pedidoId, order})}`,
+        Author: "Decoratie",
+        Subject: "Relatorio de pedido",
+      },
+    });
+    const cliente = isPlainObject(order.cliente) ? order.cliente : {};
+    const frete = isPlainObject(order.frete) ? order.frete : {};
+    const pagamento = isPlainObject(order.pagamento) ? order.pagamento : {};
+    const itens = getOrderReportItems(order);
+    const code = getOrderReportCode({pedidoId, order});
+    const status = getOrderReportStatusLabel(order.status);
+    const paymentLabel = getOrderReportPaymentLabel(pagamento);
+    const paymentStatus = getOrderReportPaymentStatusLabel(pagamento);
+    const authorizationCode = getOrderReportPaymentAuthorizationCode(pagamento);
+    const trackingCode = String(
+        order?.rastreio?.codigo ||
+        order?.codigoRastreio ||
+        order?.trackingCode ||
+        order?.envio?.codigoRastreio ||
+        "",
+    ).trim();
+    const deliveryValue = frete.valorPendente ?
+      "A combinar" :
+      formatNotificationCurrency(frete.valorFinal ?? frete.valor);
+    const endereco = isPlainObject(cliente.endereco) ? cliente.endereco : {};
+    const enderecoLines = formatOrderAddress(endereco).split(" | ").filter(Boolean);
+    const addressText = enderecoLines.join(" - ");
+    const subtotal = typeof order.subtotal === "number" ?
+      order.subtotal :
+      itens.reduce((sum, item) => {
+        return sum + (toNumber(item?.preco) * toNumber(item?.quantidade));
+      }, 0);
+    const page = {
+      left: doc.page.margins.left,
+      right: doc.page.width - doc.page.margins.right,
+      top: doc.page.margins.top,
+      bottom: doc.page.height - doc.page.margins.bottom,
+      width: doc.page.width - doc.page.margins.left - doc.page.margins.right,
+    };
+    const colors = {
+      ink: "#1f1d1b",
+      muted: "#6d7b76",
+      soft: "#f8f5f1",
+      card: "#fffdf9",
+      line: "#ded8cf",
+      accent: "#cd805d",
+      sage: "#55756f",
+      sageSoft: "#edf2ef",
+      accentSoft: "#f7e8df",
+    };
+
+    function safe(value, fallback = "--") {
+      const text = String(value ?? "").trim();
+      return text || fallback;
+    }
+
+    function fit(value, limit = 80) {
+      const text = safe(value);
+      return text.length > limit ? `${text.slice(0, Math.max(0, limit - 3))}...` : text;
+    }
+
+    function labelValue(label, value, x, y, width, options = {}) {
+      const textOptions = {
+        width,
+        lineGap: 1,
+      };
+
+      if (options.height) {
+        textOptions.height = options.height;
+      }
+
+      if (options.ellipsis) {
+        textOptions.ellipsis = true;
+      }
+
+      doc
+          .font("Helvetica-Bold")
+          .fontSize(7.5)
+          .fillColor(colors.muted)
+          .text(String(label || "").toUpperCase(), x, y, {
+            width,
+            characterSpacing: 0.4,
+          });
+      doc
+          .font(options.bold ? "Helvetica-Bold" : "Helvetica")
+          .fontSize(options.size || 9.2)
+          .fillColor(options.color || colors.ink)
+          .text(fit(value, options.limit || 92), x, y + 11, textOptions);
+    }
+
+    function card(x, y, width, height, title) {
+      doc
+          .roundedRect(x, y, width, height, 10)
+          .fillAndStroke(colors.card, colors.line);
+      doc
+          .font("Helvetica-Bold")
+          .fontSize(8)
+          .fillColor(colors.sage)
+          .text(String(title || "").toUpperCase(), x + 12, y + 11, {
+            width: width - 24,
+            characterSpacing: 0.6,
+          });
+    }
+
+    function drawStatusTag(text, x, y, color, fill) {
+      const width = Math.min(130, Math.max(74, doc.widthOfString(safe(text)) + 20));
+
+      doc
+          .roundedRect(x, y, width, 20, 10)
+          .fill(fill);
+      doc
+          .font("Helvetica-Bold")
+          .fontSize(7.5)
+          .fillColor(color)
+          .text(safe(text).toUpperCase(), x, y + 6, {
+            width,
+            align: "center",
+          });
+      return width;
+    }
+
+    function drawProductsTable() {
+      const tableX = page.left;
+      const tableWidth = page.width;
+      const startY = 360;
+      const headerHeight = 24;
+      const rowHeight = 25;
+      const maxRows = 10;
+      const visibleItems = itens.slice(0, maxRows);
+      const cols = {
+        product: tableX + 12,
+        qty: tableX + tableWidth - 164,
+        unit: tableX + tableWidth - 115,
+        total: tableX + tableWidth - 56,
+      };
+
+      doc
+          .font("Helvetica-Bold")
+          .fontSize(9)
+          .fillColor(colors.sage)
+          .text("PRODUTOS", tableX, startY - 18, {
+            width: tableWidth,
+            characterSpacing: 0.6,
+          });
+      doc
+          .roundedRect(tableX, startY, tableWidth, headerHeight, 8)
+          .fill(colors.sage);
+      doc
+          .font("Helvetica-Bold")
+          .fontSize(8.2)
+          .fillColor("#ffffff")
+          .text("Produto", cols.product, startY + 8, {width: 285})
+          .text("Qtd", cols.qty, startY + 8, {width: 36, align: "right"})
+          .text("Unit.", cols.unit, startY + 8, {width: 50, align: "right"})
+          .text("Total", cols.total, startY + 8, {width: 56, align: "right"});
+
+      if (!itens.length) {
+        doc
+            .font("Helvetica")
+            .fontSize(9)
+            .fillColor(colors.muted)
+            .text("Nenhum produto informado.", tableX + 12, startY + 38);
+      }
+
+      visibleItems.forEach((item, index) => {
+        const rowY = startY + headerHeight + 5 + index * rowHeight;
+        const fill = index % 2 === 0 ? colors.card : "#fbfaf7";
+        const quantidade = toNumber(item?.quantidade);
+        const preco = toNumber(item?.preco);
+        const total = preco * quantidade;
+
+        doc
+            .roundedRect(tableX, rowY, tableWidth, rowHeight - 2, 6)
+            .fill(fill);
+        doc
+            .font("Helvetica")
+            .fontSize(8.2)
+            .fillColor(colors.ink)
+            .text(safe(item?.nome, "Produto"), cols.product, rowY + 7, {
+              width: 285,
+              ellipsis: true,
+            })
+            .text(String(quantidade), cols.qty, rowY + 7, {
+              width: 36,
+              align: "right",
+            })
+            .text(formatNotificationCurrency(preco), cols.unit, rowY + 7, {
+              width: 50,
+              align: "right",
+            })
+            .font("Helvetica-Bold")
+            .text(formatNotificationCurrency(total), cols.total, rowY + 7, {
+              width: 56,
+              align: "right",
+            });
+      });
+
+      if (itens.length > visibleItems.length) {
+        doc
+            .font("Helvetica")
+            .fontSize(8)
+            .fillColor(colors.muted)
+            .text(
+                `+ ${itens.length - visibleItems.length} item(ns) adicionais no pedido.`,
+                tableX + 12,
+                startY + headerHeight + 8 + visibleItems.length * rowHeight,
+                {width: tableWidth - 24},
+            );
+      }
+    }
+
+    function drawTotals() {
+      const width = 236;
+      const x = page.right - width;
+      const y = 676;
+
+      doc
+          .roundedRect(x, y, width, 92, 10)
+          .fillAndStroke(colors.card, colors.line);
+
+      [
+        ["Subtotal", formatNotificationCurrency(subtotal)],
+        ["Entrega/retirada", deliveryValue],
+      ].forEach(([label, value], index) => {
+        const rowY = y + 14 + index * 20;
+        doc
+            .font("Helvetica")
+            .fontSize(8.5)
+            .fillColor(colors.muted)
+            .text(label, x + 14, rowY, {width: 108})
+            .font("Helvetica-Bold")
+            .fillColor(colors.ink)
+            .text(value, x + 114, rowY, {width: 108, align: "right"});
+      });
+
+      doc
+          .moveTo(x + 14, y + 56)
+          .lineTo(x + width - 14, y + 56)
+          .lineWidth(0.6)
+          .strokeColor(colors.line)
+          .stroke();
+      doc
+          .font("Helvetica-Bold")
+          .fontSize(9.5)
+          .fillColor(colors.ink)
+          .text("Total", x + 14, y + 70, {width: 70})
+          .fontSize(14)
+          .fillColor(colors.accent)
+          .text(formatNotificationCurrency(order.total), x + 88, y + 67, {
+            width: 134,
+            align: "right",
+          });
+    }
+
+    doc.on("data", (chunk) => chunks.push(chunk));
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", reject);
+
+    doc.rect(0, 0, doc.page.width, doc.page.height).fill("#ffffff");
+    doc
+        .rect(0, 0, doc.page.width, 8)
+        .fill(colors.accent);
+    doc
+        .font("Helvetica-Bold")
+        .fontSize(10)
+        .fillColor(colors.sage)
+        .text("DECORATIE", page.left, 30, {
+          width: 200,
+          characterSpacing: 1.6,
+        });
+    doc
+        .font("Helvetica-Bold")
+        .fontSize(22)
+        .fillColor(colors.ink)
+        .text(`Pedido ${code}`, page.left, 48, {
+          width: 260,
+        });
+    doc
+        .font("Helvetica")
+        .fontSize(8.5)
+        .fillColor(colors.muted)
+        .text("Relatorio administrativo do pedido", page.left, 76, {
+          width: 260,
+        });
+
+    doc
+        .font("Helvetica-Bold")
+        .fontSize(18)
+        .fillColor(colors.accent)
+        .text(formatNotificationCurrency(order.total), page.right - 180, 45, {
+          width: 180,
+          align: "right",
+        });
+    drawStatusTag(status, page.right - 180, 74, colors.sage, colors.sageSoft);
+    drawStatusTag(paymentStatus, page.right - 90, 74, colors.accent, colors.accentSoft);
+
+    const topY = 112;
+    const gap = 10;
+    const cardWidth = (page.width - gap) / 2;
+    const leftX = page.left;
+    const rightX = page.left + cardWidth + gap;
+
+    card(leftX, topY, cardWidth, 118, "Cliente");
+    labelValue("Nome", cliente.nome, leftX + 12, topY + 32, cardWidth - 24);
+    labelValue("E-mail", cliente.email, leftX + 12, topY + 62, cardWidth - 24);
+    labelValue("Telefone", cliente.telefone, leftX + 12, topY + 92, cardWidth - 24);
+
+    card(rightX, topY, cardWidth, 118, "Resumo");
+    labelValue("Data", formatOrderReportDate(order.createdAt), rightX + 12, topY + 32, cardWidth / 2 - 18);
+    labelValue("Pagamento", paymentLabel, rightX + cardWidth / 2, topY + 32, cardWidth / 2 - 12);
+    labelValue("Status", status, rightX + 12, topY + 68, cardWidth / 2 - 18);
+    labelValue("Autorizacao", authorizationCode, rightX + cardWidth / 2, topY + 68, cardWidth / 2 - 12);
+    if (trackingCode) {
+      labelValue("Rastreio", trackingCode, rightX + 12, topY + 94, cardWidth - 24, {
+        limit: 56,
+      });
+    }
+
+    card(page.left, 244, page.width, 82, "Entrega ou retirada");
+    labelValue("Tipo", getOrderEntregaRetiradaLabel(frete), page.left + 12, 276, 150, {
+      height: 40,
+      ellipsis: true,
+    });
+    labelValue(
+        "Prazo",
+        getOrderReportDeadlineLabel(frete),
+        page.left + 184,
+        276,
+        114,
+        {
+          height: 40,
+          ellipsis: true,
+        },
+    );
+    labelValue("Valor", deliveryValue, page.left + 316, 276, 64, {
+      height: 40,
+      ellipsis: true,
+    });
+    labelValue("Endereco", addressText, page.left + 396, 276, page.width - 408, {
+      limit: 88,
+      size: 8.4,
+      height: 40,
+      ellipsis: true,
+    });
+
+    drawProductsTable();
+    drawTotals();
+
+    doc
+        .font("Helvetica")
+        .fontSize(7.5)
+        .fillColor(colors.muted)
+        .text(
+            `Gerado em ${formatOrderReportDate(new Date())}`,
+            page.left,
+            786,
+            {width: page.width, align: "right"},
+        );
+
+    doc.end();
+  });
+}
+
+function buildOrderNotificationSummary({pedidoId, order, adminUrl}) {
+  const cliente = isPlainObject(order.cliente) ? order.cliente : {};
+  const itens = Array.isArray(order.itens) ? order.itens : [];
+  const orderNumber = Number(order.orderNumber || 0);
+  const pedidoCodigo = Number.isFinite(orderNumber) && orderNumber > 0 ?
+    String(Math.floor(orderNumber)) :
+    pedidoId;
+
+  return {
+    loja: "Decoratie",
+    pedidoId,
+    pedidoCodigo,
+    orderNumber: Number.isFinite(orderNumber) && orderNumber > 0 ?
+      Math.floor(orderNumber) :
+      null,
+    clienteNome: String(cliente.nome || "").trim(),
+    clienteTelefone: String(cliente.telefone || "").trim(),
+    enderecoEntrega: formatOrderAddress(cliente.endereco),
+    tipoEntrega: getOrderEntregaRetiradaLabel(order.frete),
+    produtos: itens.map((item) => ({
+      nome: String(item?.nome || "Produto").trim(),
+      quantidade: toNumber(item?.quantidade),
+      valor: toNumber(item?.preco) * toNumber(item?.quantidade),
+    })),
+    total: toNumber(order.total),
+    totalFormatado: formatNotificationCurrency(order.total),
+    formaPagamento: getOrderPaymentLabel(order.pagamento),
+    adminUrl,
+  };
+}
+
+function buildOrderNotificationText(summary) {
+  const lines = [
+    "Novo pedido recebido na Decoratie",
+    "",
+    `Pedido: ${summary.pedidoCodigo}`,
+    `Cliente: ${summary.clienteNome || "Não informado"}`,
+    `Telefone: ${summary.clienteTelefone || "Não informado"}`,
+  ];
+
+  if (summary.enderecoEntrega) {
+    lines.push(`Endereço de entrega: ${summary.enderecoEntrega}`);
+  }
+
+  lines.push(
+      `Entrega/retirada: ${summary.tipoEntrega || "Não informado"}`,
+      `Pagamento: ${summary.formaPagamento || "Não informado"}`,
+      "",
+      "Produtos:",
+  );
+
+  summary.produtos.forEach((item) => {
+    lines.push(
+        `- ${item.quantidade}x ${item.nome} (${formatNotificationCurrency(item.valor)})`,
+    );
+  });
+
+  lines.push("", `Total: ${summary.totalFormatado}`);
+
+  if (summary.adminUrl) {
+    lines.push(`Painel administrativo: ${summary.adminUrl}`);
+  }
+
+  return lines.join("\n");
+}
+
+async function postNotificationJson(url, payload, headers = {}) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Accept": "application/json",
+      "Content-Type": "application/json",
+      ...headers,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`HTTP ${response.status}${text ? `: ${text}` : ""}`);
+  }
+
+  return response.json().catch(() => ({}));
+}
+
+async function sendOrderEmailNotification({config, summary, text, to = "", subject = ""}) {
+  const provider = getEmailNotificationProviderConfig();
+  const recipient = normalizeNotificationEmail(to || config.email.destino);
+  const resolvedSubject = subject || `Decoratie - novo pedido ${summary.pedidoCodigo}`;
+
+  if (!provider.configured) {
+    console.warn("[notificacoes] provedor de e-mail nao configurado", {
+      pedidoId: summary.pedidoId,
+      env: [
+        "ORDER_NOTIFICATION_EMAIL_WEBHOOK_URL",
+        "ORDER_NOTIFICATION_RESEND_API_KEY",
+        "ORDER_NOTIFICATION_EMAIL_FROM",
+      ],
+    });
+    return {sent: false, reason: "email_provider_not_configured"};
+  }
+
+  if (!recipient) {
+    return {sent: false, reason: "email_recipient_not_configured"};
+  }
+
+  if (provider.webhookUrl) {
+    await postNotificationJson(provider.webhookUrl, {
+      channel: "email",
+      to: recipient,
+      subject: resolvedSubject,
+      text,
+      summary,
+    });
+    return {sent: true};
+  }
+
+  await postNotificationJson(
+      "https://api.resend.com/emails",
+      {
+        from: provider.from,
+        to: [recipient],
+        subject: resolvedSubject,
+        text,
+      },
+      {
+        "Authorization": `Bearer ${provider.resendApiKey}`,
+      },
+  );
+
+  return {sent: true};
+}
+
+async function sendOrderWhatsappNotification({config, summary, text, to = ""}) {
+  const provider = getWhatsappNotificationProviderConfig();
+  const recipient = normalizeNotificationPhone(to || config.whatsapp.destino);
+
+  if (!provider.configured) {
+    console.warn("[notificacoes] provedor de WhatsApp nao configurado", {
+      pedidoId: summary.pedidoId,
+      env: [
+        "ORDER_NOTIFICATION_WHATSAPP_WEBHOOK_URL",
+        "ORDER_NOTIFICATION_WHATSAPP_ACCESS_TOKEN",
+        "ORDER_NOTIFICATION_WHATSAPP_PHONE_NUMBER_ID",
+      ],
+    });
+    return {sent: false, reason: "whatsapp_provider_not_configured"};
+  }
+
+  if (!recipient || !isNotificationPhoneReady(recipient)) {
+    return {sent: false, reason: "whatsapp_recipient_not_configured"};
+  }
+
+  if (provider.webhookUrl) {
+    await postNotificationJson(provider.webhookUrl, {
+      channel: "whatsapp",
+      to: recipient,
+      text,
+      summary,
+    });
+    return {sent: true};
+  }
+
+  await postNotificationJson(
+      `https://graph.facebook.com/${provider.apiVersion}/${provider.phoneNumberId}/messages`,
+      {
+        messaging_product: "whatsapp",
+        to: recipient,
+        type: "text",
+        text: {
+          preview_url: false,
+          body: text,
+        },
+      },
+      {
+        "Authorization": `Bearer ${provider.accessToken}`,
+      },
+  );
+
+  return {sent: true};
+}
+
+async function notifyStoreAboutOrder({
+  pedidoId,
+  notificationToken,
+  req,
+  force = false,
+  requireNotificationToken = true,
+  triggeredBy = "",
+}) {
+  const config = await loadOrderNotificationConfig();
+  const orderRef = db.collection("pedidos").doc(pedidoId);
+  const lockId = crypto.randomUUID();
+  let pending = {email: false, whatsapp: false};
+  let order = null;
+  let skipped = null;
+
+  await db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(orderRef);
+
+    if (!snapshot.exists) {
+      throw createHttpError(
+          404,
+          "pedido_nao_encontrado",
+          "Pedido nao encontrado para notificacao.",
+      );
+    }
+
+    const currentOrder = snapshot.data() || {};
+    const storedToken = String(currentOrder.notificationToken || "");
+
+    if (
+      requireNotificationToken &&
+      (!storedToken || storedToken !== String(notificationToken || ""))
+    ) {
+      throw createHttpError(
+          403,
+          "notificacao_token_invalido",
+          "Token de notificacao invalido para este pedido.",
+      );
+    }
+
+    const processingAt = toDate(currentOrder.notificationProcessingAt);
+    const locked = currentOrder.notificationProcessingId &&
+      processingAt &&
+      processingAt.getTime() > Date.now() - ORDER_NOTIFICATION_LOCK_TTL_MS;
+
+    if (locked) {
+      skipped = "notification_in_progress";
+      return;
+    }
+
+    pending = {
+      email: Boolean(
+          config.email.ativo &&
+          config.email.destino &&
+          (force || currentOrder.notificationEmailSent !== true),
+      ),
+      whatsapp: Boolean(
+          config.whatsapp.ativo &&
+          config.whatsapp.destino &&
+          (force || currentOrder.notificationWhatsappSent !== true),
+      ),
+    };
+
+    if (!pending.email && !pending.whatsapp) {
+      skipped = "no_pending_channels";
+      return;
+    }
+
+    order = currentOrder;
+    transaction.set(orderRef, {
+      notificationProcessingId: lockId,
+      notificationProcessingAt: admin.firestore.FieldValue.serverTimestamp(),
+      notificationError: admin.firestore.FieldValue.delete(),
+    }, {merge: true});
+  });
+
+  if (skipped) {
+    return {
+      sucesso: true,
+      skipped,
+      notificationEmailSent: false,
+      notificationWhatsappSent: false,
+    };
+  }
+
+  const summary = buildOrderNotificationSummary({
+    pedidoId,
+    order,
+    adminUrl: buildOrderAdminUrl(req, pedidoId),
+  });
+  const text = buildOrderNotificationText(summary);
+  const errors = [];
+  let emailSent = false;
+  let whatsappSent = false;
+
+  if (pending.email) {
+    try {
+      const result = await sendOrderEmailNotification({config, summary, text});
+      emailSent = Boolean(result.sent);
+      if (!result.sent) {
+        errors.push(`E-mail: ${result.reason || "nao enviado"}`);
+      }
+    } catch (error) {
+      errors.push(`E-mail: ${error.message || "erro ao enviar"}`);
+    }
+  }
+
+  if (pending.whatsapp) {
+    try {
+      const result = await sendOrderWhatsappNotification({config, summary, text});
+      whatsappSent = Boolean(result.sent);
+      if (!result.sent) {
+        errors.push(`WhatsApp: ${result.reason || "nao enviado"}`);
+      }
+    } catch (error) {
+      errors.push(`WhatsApp: ${error.message || "erro ao enviar"}`);
+    }
+  }
+
+  const updatePayload = {
+    notificationProcessingId: admin.firestore.FieldValue.delete(),
+    notificationProcessingAt: admin.firestore.FieldValue.delete(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+
+  if (pending.email) {
+    updatePayload.notificationEmailSent = emailSent;
+  }
+
+  if (pending.whatsapp) {
+    updatePayload.notificationWhatsappSent = whatsappSent;
+  }
+
+  if (emailSent || whatsappSent) {
+    updatePayload.notificationSentAt = admin.firestore.FieldValue.serverTimestamp();
+  }
+
+  if (force) {
+    updatePayload.notificationResentAt = admin.firestore.FieldValue.serverTimestamp();
+    updatePayload.notificationResentBy = String(triggeredBy || "admin").slice(0, 200);
+  }
+
+  if (errors.length) {
+    updatePayload.notificationError = errors.join(" | ").slice(0, 1500);
+  } else {
+    updatePayload.notificationError = admin.firestore.FieldValue.delete();
+  }
+
+  await orderRef.set(updatePayload, {merge: true});
+
+  return {
+    sucesso: true,
+    notificationEmailSent: emailSent,
+    notificationWhatsappSent: whatsappSent,
+    notificationError: errors.join(" | "),
+    resent: Boolean(force),
+  };
+}
+
+function getOrderTrackingCode(order = {}) {
+  return String(
+      order?.rastreio?.codigo ||
+      order?.codigoRastreio ||
+      order?.trackingCode ||
+      order?.envio?.codigoRastreio ||
+      "",
+  ).trim();
+}
+
+function buildOrderTrackingStatusSummary({pedidoId, order, trackingCode}) {
+  const cliente = isPlainObject(order.cliente) ? order.cliente : {};
+  const orderNumber = Number(order.orderNumber || 0);
+  const pedidoCodigo = Number.isFinite(orderNumber) && orderNumber > 0 ?
+    String(Math.floor(orderNumber)) :
+    pedidoId;
+
+  return {
+    loja: "Decoratie",
+    pedidoId,
+    pedidoCodigo,
+    clienteNome: String(cliente.nome || "").trim(),
+    clienteEmail: normalizeNotificationEmail(cliente.email),
+    clienteTelefone: normalizeNotificationPhone(cliente.telefone),
+    status: getOrderReportStatusLabel(order.status || "enviado"),
+    codigoRastreio: trackingCode,
+    tipoEntrega: getOrderEntregaRetiradaLabel(order.frete),
+  };
+}
+
+function buildOrderTrackingStatusText(summary) {
+  const firstName = String(summary.clienteNome || "").trim().split(/\s+/)[0];
+  const lines = [
+    firstName ? `Ola, ${firstName}.` : "Ola.",
+    "",
+    "A Decoratie atualizou o status do seu pedido.",
+    "",
+    `Pedido: ${summary.pedidoCodigo}`,
+    `Status: ${summary.status}`,
+    `Codigo de rastreio: ${summary.codigoRastreio}`,
+  ];
+
+  if (summary.tipoEntrega) {
+    lines.push(`Entrega/retirada: ${summary.tipoEntrega}`);
+  }
+
+  lines.push(
+      "",
+      "Use o codigo de rastreio para acompanhar a entrega junto a transportadora.",
+      "Obrigada por comprar na Decoratie.",
+  );
+
+  return lines.join("\n");
+}
+
+async function notifyCustomerAboutTrackingStatus({
+  pedidoId,
+  trackingCode = "",
+  triggeredBy = "",
+}) {
+  const config = await loadOrderNotificationConfig();
+  const emailProviderConfigured = getEmailNotificationProviderConfig().configured;
+  const whatsappProviderConfigured = getWhatsappNotificationProviderConfig().configured;
+  const orderRef = db.collection("pedidos").doc(pedidoId);
+  const lockId = crypto.randomUUID();
+  let pending = {email: false, whatsapp: false};
+  let order = null;
+  let resolvedTrackingCode = String(trackingCode || "").trim();
+  let skipped = null;
+
+  await db.runTransaction(async (transaction) => {
+    const snapshot = await transaction.get(orderRef);
+
+    if (!snapshot.exists) {
+      throw createHttpError(
+          404,
+          "pedido_nao_encontrado",
+          "Pedido nao encontrado para notificacao.",
+      );
+    }
+
+    const currentOrder = snapshot.data() || {};
+    resolvedTrackingCode = resolvedTrackingCode || getOrderTrackingCode(currentOrder);
+
+    if (!resolvedTrackingCode) {
+      throw createHttpError(
+          422,
+          "codigo_rastreio_obrigatorio",
+          "Informe o codigo de rastreio para notificar o cliente.",
+      );
+    }
+
+    const processingAt = toDate(currentOrder.trackingNotificationProcessingAt);
+    const locked = currentOrder.trackingNotificationProcessingId &&
+      processingAt &&
+      processingAt.getTime() > Date.now() - ORDER_NOTIFICATION_LOCK_TTL_MS;
+
+    if (locked) {
+      skipped = "tracking_notification_in_progress";
+      return;
+    }
+
+    const cliente = isPlainObject(currentOrder.cliente) ? currentOrder.cliente : {};
+    const clienteEmail = normalizeNotificationEmail(cliente.email);
+    const clienteWhatsapp = normalizeNotificationPhone(cliente.telefone);
+    const sameCode = currentOrder.trackingNotificationCode === resolvedTrackingCode;
+
+    pending = {
+      email: Boolean(
+          config.email.ativo &&
+          emailProviderConfigured &&
+          clienteEmail &&
+          !(sameCode && currentOrder.trackingNotificationEmailSent === true),
+      ),
+      whatsapp: Boolean(
+          config.whatsapp.ativo &&
+          whatsappProviderConfigured &&
+          clienteWhatsapp &&
+          isNotificationPhoneReady(clienteWhatsapp) &&
+          !(sameCode && currentOrder.trackingNotificationWhatsappSent === true),
+      ),
+    };
+
+    if (!pending.email && !pending.whatsapp) {
+      skipped = sameCode &&
+        (currentOrder.trackingNotificationEmailSent === true ||
+          currentOrder.trackingNotificationWhatsappSent === true) ?
+        "tracking_notification_already_sent" :
+        "tracking_notification_no_channels";
+      return;
+    }
+
+    order = currentOrder;
+    transaction.set(orderRef, {
+      trackingNotificationProcessingId: lockId,
+      trackingNotificationProcessingAt: admin.firestore.FieldValue.serverTimestamp(),
+      trackingNotificationError: admin.firestore.FieldValue.delete(),
+    }, {merge: true});
+  });
+
+  if (skipped) {
+    return {
+      sucesso: true,
+      skipped,
+      trackingNotificationEmailSent: false,
+      trackingNotificationWhatsappSent: false,
+      trackingNotificationCode: resolvedTrackingCode,
+    };
+  }
+
+  const summary = buildOrderTrackingStatusSummary({
+    pedidoId,
+    order,
+    trackingCode: resolvedTrackingCode,
+  });
+  const text = buildOrderTrackingStatusText(summary);
+  const subject = `Decoratie - pedido ${summary.pedidoCodigo} enviado`;
+  const errors = [];
+  let emailSent = false;
+  let whatsappSent = false;
+
+  if (pending.email) {
+    try {
+      const result = await sendOrderEmailNotification({
+        config,
+        summary,
+        text,
+        to: summary.clienteEmail,
+        subject,
+      });
+      emailSent = Boolean(result.sent);
+      if (!result.sent) {
+        errors.push(`E-mail: ${result.reason || "nao enviado"}`);
+      }
+    } catch (error) {
+      errors.push(`E-mail: ${error.message || "erro ao enviar"}`);
+    }
+  }
+
+  if (pending.whatsapp) {
+    try {
+      const result = await sendOrderWhatsappNotification({
+        config,
+        summary,
+        text,
+        to: summary.clienteTelefone,
+      });
+      whatsappSent = Boolean(result.sent);
+      if (!result.sent) {
+        errors.push(`WhatsApp: ${result.reason || "nao enviado"}`);
+      }
+    } catch (error) {
+      errors.push(`WhatsApp: ${error.message || "erro ao enviar"}`);
+    }
+  }
+
+  const updatePayload = {
+    trackingNotificationProcessingId: admin.firestore.FieldValue.delete(),
+    trackingNotificationProcessingAt: admin.firestore.FieldValue.delete(),
+    trackingNotificationCode: resolvedTrackingCode,
+    trackingNotificationStatus: order.status || "enviado",
+    trackingNotificationRequestedAt: admin.firestore.FieldValue.serverTimestamp(),
+    trackingNotificationRequestedBy: String(triggeredBy || "admin").slice(0, 200),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+
+  const sameCodeBeforeSend = order.trackingNotificationCode === resolvedTrackingCode;
+  updatePayload.trackingNotificationEmailSent = pending.email ?
+    emailSent :
+    Boolean(sameCodeBeforeSend && order.trackingNotificationEmailSent === true);
+  updatePayload.trackingNotificationWhatsappSent = pending.whatsapp ?
+    whatsappSent :
+    Boolean(sameCodeBeforeSend && order.trackingNotificationWhatsappSent === true);
+
+  if (emailSent || whatsappSent) {
+    updatePayload.trackingNotificationSentAt = admin.firestore.FieldValue.serverTimestamp();
+  }
+
+  if (errors.length) {
+    updatePayload.trackingNotificationError = errors.join(" | ").slice(0, 1500);
+  } else {
+    updatePayload.trackingNotificationError = admin.firestore.FieldValue.delete();
+  }
+
+  await orderRef.set(updatePayload, {merge: true});
+
+  return {
+    sucesso: true,
+    trackingNotificationEmailSent: updatePayload.trackingNotificationEmailSent,
+    trackingNotificationWhatsappSent: updatePayload.trackingNotificationWhatsappSent,
+    trackingNotificationError: errors.join(" | "),
+    trackingNotificationCode: resolvedTrackingCode,
+  };
+}
+
+function sendOrderNotificationError(res, error, fallbackMessage = "Nao foi possivel notificar a loja.") {
+  console.error("[notificacoes] erro", {
+    code: error.code || "notificacao_pedido_erro",
+    statusCode: error.statusCode || 500,
+    message: error.message,
+    details: error.details || null,
+  });
+
+  return res.status(error.statusCode || 500).json({
+    erro: error.message || fallbackMessage,
+    code: error.code || "notificacao_pedido_erro",
+    details: error.details || null,
+  });
+}
+
+function sendOrderCreateError(res, error) {
+  console.error("[pedidos] erro ao criar pedido", {
+    code: error.code || "pedido_criacao_erro",
+    statusCode: error.statusCode || 500,
+    message: error.message,
+    details: error.details || null,
+  });
+
+  return res.status(error.statusCode || 500).json({
+    erro: error.message || "Nao foi possivel criar o pedido.",
+    code: error.code || "pedido_criacao_erro",
+    details: error.details || null,
+  });
+}
+
 function sendFreteError(res, error, config = null) {
   console.error("[frete] erro", {
     code: error.code || "frete_erro",
@@ -2597,6 +4363,10 @@ function normalizeMercadoPagoPaymentRecord(payment, method) {
     installments: payment?.installments || (method === "credit_card" ? 1 : null),
     paymentMethodId: payment?.payment_method_id || paymentMethod.id || "",
     paymentTypeId: paymentMethod.type || "",
+    authorizationCode: payment?.authorization_code ||
+      payment?.authorizationCode ||
+      transactionDetails.authorization_code ||
+      "",
     issuerId: payment?.issuer_id || payment?.issuer?.id || "",
     cardBrand: paymentMethod.id || "",
     lastFourDigits: card.last_four_digits || "",
@@ -2740,6 +4510,75 @@ function parseMercadoPagoSignatureHeader(value) {
   return parsed;
 }
 
+function normalizeMercadoPagoSignatureDataId(value) {
+  const rawValue = String(value || "").trim();
+
+  if (!rawValue) {
+    return "";
+  }
+
+  return /^[a-z0-9]+$/i.test(rawValue) ? rawValue.toLowerCase() : rawValue;
+}
+
+function getMercadoPagoWebhookQueryValue(req, key) {
+  const queryValue = req.query?.[key];
+
+  if (queryValue !== undefined && queryValue !== null) {
+    return Array.isArray(queryValue) ? queryValue[0] : queryValue;
+  }
+
+  try {
+    const requestUrl = new URL(req.originalUrl || req.url || "", "https://decoratie.local");
+    return requestUrl.searchParams.get(key) || "";
+  } catch (error) {
+    return "";
+  }
+}
+
+function getMercadoPagoSignatureDataIdCandidates(req) {
+  const body = isPlainObject(req.body) ? req.body : {};
+  const queryData = isPlainObject(req.query?.data) ? req.query.data : {};
+  const values = [
+    getMercadoPagoWebhookQueryValue(req, "data.id"),
+    getMercadoPagoWebhookQueryValue(req, "id"),
+    getMercadoPagoWebhookQueryValue(req, "data_id"),
+    queryData.id,
+    body.data?.id,
+    body.id,
+  ];
+  const candidates = [];
+
+  values.forEach((value) => {
+    const normalized = normalizeMercadoPagoSignatureDataId(value);
+
+    if (normalized && !candidates.includes(normalized)) {
+      candidates.push(normalized);
+    }
+  });
+
+  candidates.push("");
+
+  return candidates;
+}
+
+function buildMercadoPagoSignatureManifest({dataId = "", requestId = "", ts = ""}) {
+  let manifest = "";
+
+  if (dataId) {
+    manifest += `id:${dataId};`;
+  }
+
+  if (requestId) {
+    manifest += `request-id:${requestId};`;
+  }
+
+  if (ts) {
+    manifest += `ts:${ts};`;
+  }
+
+  return manifest;
+}
+
 function safeCompareHex(first, second) {
   const firstBuffer = Buffer.from(String(first || ""), "hex");
   const secondBuffer = Buffer.from(String(second || ""), "hex");
@@ -2770,34 +4609,31 @@ function verifyMercadoPagoWebhookSignature(req, secret) {
     );
   }
 
-  const queryDataId = String(req.query["data.id"] || "").trim();
-  const dataId = /^[a-z0-9]+$/i.test(queryDataId) ?
-    queryDataId.toLowerCase() :
-    queryDataId;
-  let manifest = "";
+  const dataIdCandidates = getMercadoPagoSignatureDataIdCandidates(req);
+  const verified = dataIdCandidates.some((dataId) => {
+    const manifest = buildMercadoPagoSignatureManifest({
+      dataId,
+      requestId: xRequestId,
+      ts,
+    });
+    const expected = crypto
+        .createHmac("sha256", secret)
+        .update(manifest)
+        .digest("hex");
 
-  if (dataId) {
-    manifest += `id:${dataId};`;
-  }
+    return safeCompareHex(expected, hash);
+  });
 
-  if (xRequestId) {
-    manifest += `request-id:${xRequestId};`;
-  }
-
-  if (ts) {
-    manifest += `ts:${ts};`;
-  }
-
-  const expected = crypto
-      .createHmac("sha256", secret)
-      .update(manifest)
-      .digest("hex");
-
-  if (!safeCompareHex(expected, hash)) {
+  if (!verified) {
     throw createHttpError(
         401,
         "mp_webhook_assinatura_invalida",
         "Assinatura do webhook Mercado Pago invalida.",
+        {
+          candidateCount: dataIdCandidates.length,
+          hasRequestId: Boolean(xRequestId),
+          queryKeys: Object.keys(req.query || {}).slice(0, 12),
+        },
     );
   }
 
@@ -4038,6 +5874,280 @@ app.post(
           auditoria: quote.auditoria,
           mensagem: quote.auditoria.mensagem,
         });
+      } catch (error) {
+        return sendFreteError(res, error);
+      }
+    },
+);
+
+app.get(
+    "/api/admin/notificacoes-pedido/config",
+    verifyAdminRequest,
+    async (req, res) => {
+      try {
+        const config = await loadOrderNotificationConfig();
+
+        return res.json({
+          config: sanitizeOrderNotificationConfigForAdmin(config),
+        });
+      } catch (error) {
+        return sendOrderNotificationError(res, error);
+      }
+    },
+);
+
+app.post(
+    "/api/admin/notificacoes-pedido/config",
+    verifyAdminRequest,
+    async (req, res) => {
+      try {
+        const body = await obterBodyJson(req);
+        const config = normalizeOrderNotificationConfig(body);
+        validateOrderNotificationConfig(config);
+
+        await db.collection("segredos").doc("notificacoes_pedido").set({
+          email: config.email,
+          whatsapp: config.whatsapp,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedBy: req.adminUser.uid,
+        }, {merge: true});
+
+        const savedConfig = await loadOrderNotificationConfig();
+
+        return res.json({
+          sucesso: true,
+          config: sanitizeOrderNotificationConfigForAdmin(savedConfig),
+        });
+      } catch (error) {
+        return sendOrderNotificationError(res, error);
+      }
+    },
+);
+
+app.post("/api/pedidos", async (req, res) => {
+  try {
+    const body = await obterBodyJson(req);
+    const orderPayload = normalizeOrderPayloadForCreate(body);
+    const result = await createOrderWithSequence(orderPayload);
+
+    return res.status(201).json({
+      sucesso: true,
+      pedidoId: result.id,
+      orderNumber: result.orderNumber,
+    });
+  } catch (error) {
+    return sendOrderCreateError(res, error);
+  }
+});
+
+app.post("/api/pedidos/:pedidoId/notificar-novo-pedido", async (req, res) => {
+  try {
+    const pedidoId = String(req.params.pedidoId || "").trim();
+    const body = await obterBodyJson(req);
+    const notificationToken = String(body.notificationToken || "").trim();
+
+    if (!pedidoId) {
+      throw createHttpError(
+          400,
+          "pedido_id_obrigatorio",
+          "Pedido obrigatorio para notificacao.",
+      );
+    }
+
+    const result = await notifyStoreAboutOrder({
+      pedidoId,
+      notificationToken,
+      req,
+    });
+
+    return res.json(result);
+  } catch (error) {
+    return sendOrderNotificationError(res, error);
+  }
+});
+
+app.post(
+    "/api/admin/pedidos/:pedidoId/reenviar-notificacao",
+    verifyAdminRequest,
+    async (req, res) => {
+      try {
+        const pedidoId = String(req.params.pedidoId || "").trim();
+
+        if (!pedidoId) {
+          throw createHttpError(
+              400,
+              "pedido_id_obrigatorio",
+              "Pedido obrigatorio para reenviar notificacao.",
+          );
+        }
+
+        const result = await notifyStoreAboutOrder({
+          pedidoId,
+          req,
+          force: true,
+          requireNotificationToken: false,
+          triggeredBy: req.adminUser.uid,
+        });
+
+        return res.json({
+          ...result,
+          pedidoId,
+        });
+      } catch (error) {
+        return sendOrderNotificationError(res, error);
+      }
+    },
+);
+
+app.post(
+    "/api/admin/pedidos/:pedidoId/notificar-rastreio",
+    verifyAdminRequest,
+    async (req, res) => {
+      try {
+        const pedidoId = String(req.params.pedidoId || "").trim();
+        const body = await obterBodyJson(req);
+        const trackingCode = String(body.trackingCode || "").trim();
+
+        if (!pedidoId) {
+          throw createHttpError(
+              400,
+              "pedido_id_obrigatorio",
+              "Pedido obrigatorio para notificar o cliente.",
+          );
+        }
+
+        const result = await notifyCustomerAboutTrackingStatus({
+          pedidoId,
+          trackingCode,
+          triggeredBy: req.adminUser.uid,
+        });
+
+        return res.json({
+          ...result,
+          pedidoId,
+        });
+      } catch (error) {
+        return sendOrderNotificationError(
+            res,
+            error,
+            "Nao foi possivel notificar o cliente.",
+        );
+      }
+    },
+);
+
+app.post(
+    "/api/admin/pedidos/normalizar-numeros",
+    verifyAdminRequest,
+    async (req, res) => {
+      try {
+        const result = await normalizeExistingOrderNumbers();
+
+        return res.json({
+          sucesso: true,
+          ...result,
+        });
+      } catch (error) {
+        return sendOrderCreateError(res, error);
+      }
+    },
+);
+
+app.get(
+    "/api/admin/pedidos/:pedidoId/relatorio-pdf",
+    verifyAdminRequest,
+    async (req, res) => {
+      try {
+        const pedidoId = String(req.params.pedidoId || "").trim();
+
+        if (!pedidoId) {
+          throw createHttpError(
+              400,
+              "pedido_id_obrigatorio",
+              "Pedido obrigatorio para gerar relatorio.",
+          );
+        }
+
+        const orderSnapshot = await db.collection("pedidos").doc(pedidoId).get();
+
+        if (!orderSnapshot.exists) {
+          throw createHttpError(
+              404,
+              "pedido_nao_encontrado",
+              "Pedido nao encontrado.",
+          );
+        }
+
+        const order = orderSnapshot.data() || {};
+        const pdf = await buildOrderReportPdfBuffer({pedidoId, order});
+        const orderNumber = getValidOrderNumber(order.orderNumber);
+        const filename = orderNumber ?
+          `decoratie-pedido-${orderNumber}-relatorio.pdf` :
+          `decoratie-pedido-relatorio.pdf`;
+
+        res.setHeader("Content-Type", "application/pdf");
+        res.setHeader("Content-Disposition", `inline; filename="${filename}"`);
+        res.setHeader("Cache-Control", "no-store");
+
+        return res.send(pdf);
+      } catch (error) {
+        return sendOrderCreateError(res, error);
+      }
+    },
+);
+
+app.get(
+    "/api/admin/pedidos/:pedidoId/etiqueta-melhor-envio",
+    verifyAdminRequest,
+    async (req, res) => {
+      try {
+        const pedidoId = String(req.params.pedidoId || "").trim();
+
+        if (!pedidoId) {
+          throw createHttpError(
+              400,
+              "pedido_id_obrigatorio",
+              "Pedido obrigatorio para imprimir etiqueta.",
+          );
+        }
+
+        const orderSnapshot = await db.collection("pedidos").doc(pedidoId).get();
+
+        if (!orderSnapshot.exists) {
+          throw createHttpError(
+              404,
+              "pedido_nao_encontrado",
+              "Pedido nao encontrado.",
+          );
+        }
+
+        const order = orderSnapshot.data() || {};
+        const melhorEnvioOrderId = getMelhorEnvioOrderIdFromOrder(order);
+
+        if (!melhorEnvioOrderId) {
+          throw createHttpError(
+              409,
+              "me_etiqueta_ausente",
+              "Este pedido ainda nao possui etiqueta gerada no Melhor Envio.",
+          );
+        }
+
+        const config = await loadFreteConfig();
+        const file = await melhorEnvioAuthenticatedFileRequest({
+          config,
+          path: `/api/v2/me/imprimir/pdf/${encodeURIComponent(melhorEnvioOrderId)}`,
+          accept: "application/pdf, application/json",
+        });
+        const orderNumber = getValidOrderNumber(order.orderNumber);
+        const filename = orderNumber ?
+          `decoratie-pedido-${orderNumber}-melhor-envio.pdf` :
+          `decoratie-etiqueta-melhor-envio-${pedidoId}.pdf`;
+
+        res.setHeader("Content-Type", file.contentType || "application/pdf");
+        res.setHeader("Content-Disposition", `inline; filename="${filename}"`);
+        res.setHeader("Cache-Control", "no-store");
+
+        return res.send(file.buffer);
       } catch (error) {
         return sendFreteError(res, error);
       }

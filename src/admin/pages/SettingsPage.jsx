@@ -16,6 +16,10 @@ import {
   testMercadoPagoConnection,
 } from '../../shared/paymentApi.js'
 import {
+  getOrderNotificationAdminConfig,
+  saveOrderNotificationAdminConfig,
+} from '../../shared/orderNotificationApi.js'
+import {
   DEFAULT_WHATSAPP_MESSAGE,
   buildWhatsAppUrl,
   getDigits,
@@ -98,6 +102,20 @@ const defaultPaymentForm = {
   conta: null,
   lastTestAt: null,
   lastError: '',
+}
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+
+const defaultNotificationForm = {
+  email: {
+    ativo: false,
+    destino: '',
+  },
+  whatsapp: {
+    ativo: false,
+    destino: '',
+  },
+  status: null,
 }
 
 function serviceKey(service) {
@@ -276,6 +294,39 @@ function paymentFormToPayload(form) {
   }
 }
 
+function notificationConfigToForm(config = {}) {
+  return {
+    ...defaultNotificationForm,
+    ...config,
+    email: {
+      ...defaultNotificationForm.email,
+      ...(config.email || {}),
+      ativo: Boolean(config.email?.ativo),
+      destino: toStringValue(config.email?.destino),
+    },
+    whatsapp: {
+      ...defaultNotificationForm.whatsapp,
+      ...(config.whatsapp || {}),
+      ativo: Boolean(config.whatsapp?.ativo),
+      destino: toStringValue(config.whatsapp?.destino),
+    },
+    status: config.status || null,
+  }
+}
+
+function notificationFormToPayload(form) {
+  return {
+    email: {
+      ativo: Boolean(form.email?.ativo),
+      destino: toStringValue(form.email?.destino).trim(),
+    },
+    whatsapp: {
+      ativo: Boolean(form.whatsapp?.ativo),
+      destino: toStringValue(form.whatsapp?.destino).trim(),
+    },
+  }
+}
+
 function settingsToForm(settings = {}) {
   const rawWhatsAppNumber = getWhatsAppInputNumber(settings)
   const whatsappNumber = normalizeWhatsAppNumber(rawWhatsAppNumber) ? rawWhatsAppNumber : ''
@@ -418,6 +469,11 @@ export default function SettingsPage() {
   const [paymentSaving, setPaymentSaving] = useState(false)
   const [paymentTesting, setPaymentTesting] = useState(false)
   const [paymentError, setPaymentError] = useState('')
+  const [notificationForm, setNotificationForm] = useState(defaultNotificationForm)
+  const [notificationDirty, setNotificationDirty] = useState(false)
+  const [notificationLoading, setNotificationLoading] = useState(false)
+  const [notificationSaving, setNotificationSaving] = useState(false)
+  const [notificationError, setNotificationError] = useState('')
 
   const freightConfigIssues = useMemo(() => {
     const issues = []
@@ -528,6 +584,34 @@ export default function SettingsPage() {
     return issues
   }, [paymentForm])
 
+  const notificationConfigIssues = useMemo(() => {
+    const issues = []
+    const emailDestino = notificationForm.email?.destino?.trim()
+    const whatsappDestino = getDigits(notificationForm.whatsapp?.destino)
+
+    if (notificationForm.email?.ativo && !emailDestino) {
+      issues.push('Informe o e-mail de destino ou desative notificacoes por e-mail.')
+    }
+
+    if (notificationForm.email?.ativo && emailDestino && !EMAIL_REGEX.test(emailDestino)) {
+      issues.push('E-mail de destino invalido.')
+    }
+
+    if (notificationForm.whatsapp?.ativo && !whatsappDestino) {
+      issues.push('Informe o WhatsApp de destino ou desative notificacoes por WhatsApp.')
+    }
+
+    if (
+      notificationForm.whatsapp?.ativo &&
+      whatsappDestino &&
+      !normalizeWhatsAppNumber(notificationForm.whatsapp.destino)
+    ) {
+      issues.push('WhatsApp de destino precisa ter DDD, com 10 ou 11 digitos, ou codigo 55.')
+    }
+
+    return issues
+  }, [notificationForm])
+
   useEffect(() => {
     if (!loading && !dirty) {
       setForm(settingsToForm(remoteSettings))
@@ -632,6 +716,39 @@ export default function SettingsPage() {
     }
   }, [paymentDirty, user])
 
+  useEffect(() => {
+    if (!user || notificationDirty) {
+      return undefined
+    }
+
+    let active = true
+    setNotificationLoading(true)
+    setNotificationError('')
+
+    getOrderNotificationAdminConfig(user)
+      .then((result) => {
+        if (!active) {
+          return
+        }
+
+        setNotificationForm(notificationConfigToForm(result.config))
+      })
+      .catch((error) => {
+        if (active) {
+          setNotificationError(error.message || 'Nao foi possivel carregar notificacoes.')
+        }
+      })
+      .finally(() => {
+        if (active) {
+          setNotificationLoading(false)
+        }
+      })
+
+    return () => {
+      active = false
+    }
+  }, [notificationDirty, user])
+
   function updateField(field, value) {
     setDirty(true)
     setForm((current) => ({
@@ -696,6 +813,17 @@ export default function SettingsPage() {
       ...current,
       metodos: {
         ...current.metodos,
+        [field]: value,
+      },
+    }))
+  }
+
+  function updateNotificationNested(group, field, value) {
+    setNotificationDirty(true)
+    setNotificationForm((current) => ({
+      ...current,
+      [group]: {
+        ...current[group],
         [field]: value,
       },
     }))
@@ -940,6 +1068,47 @@ export default function SettingsPage() {
     }
   }
 
+  async function handleNotificationSubmit(event) {
+    event.preventDefault()
+    setNotificationSaving(true)
+    setNotificationError('')
+
+    if (notificationConfigIssues.length) {
+      const message = notificationConfigIssues[0]
+      setNotificationError(message)
+      notify({
+        type: 'error',
+        title: 'Revise as notificacoes',
+        description: message,
+      })
+      setNotificationSaving(false)
+      return
+    }
+
+    try {
+      const result = await saveOrderNotificationAdminConfig(
+        user,
+        notificationFormToPayload(notificationForm),
+      )
+      setNotificationForm(notificationConfigToForm(result.config))
+      setNotificationDirty(false)
+      notify({
+        type: 'success',
+        title: 'Notificacoes salvas',
+        description: 'Preferencias de novo pedido atualizadas.',
+      })
+    } catch (error) {
+      setNotificationError(error.message || 'Nao foi possivel salvar notificacoes.')
+      notify({
+        type: 'error',
+        title: 'Nao foi possivel salvar notificacoes',
+        description: error.message || 'Revise os dados e tente novamente.',
+      })
+    } finally {
+      setNotificationSaving(false)
+    }
+  }
+
   const connection = freightForm.conexao || defaultFreightForm.conexao
   const connectionStatus = connection.status || 'not_connected'
   const connectionLabel = getConnectionStatusLabel(connectionStatus)
@@ -1047,6 +1216,99 @@ export default function SettingsPage() {
         <div className="admin-form-actions">
           <button type="submit" className="admin-btn" disabled={saving}>
             {saving ? 'Salvando...' : 'Salvar configuracoes'}
+          </button>
+        </div>
+      </form>
+
+      <form className="admin-surface admin-form" onSubmit={handleNotificationSubmit}>
+        <div className="admin-surface-head">
+          <div>
+            <h2>Notificacoes de novo pedido</h2>
+            <p>Avise a Decoratie por e-mail e WhatsApp quando o checkout criar um pedido.</p>
+          </div>
+        </div>
+
+        {notificationLoading ? (
+          <div className="admin-inline-notice">Carregando notificacoes...</div>
+        ) : null}
+
+        {notificationError ? (
+          <div className="admin-inline-notice is-danger">{notificationError}</div>
+        ) : null}
+
+        {notificationConfigIssues.length ? (
+          <div className="admin-inline-notice">
+            <strong>Pendencias das notificacoes</strong>
+            <ul className="admin-freight-issue-list">
+              {notificationConfigIssues.map((issue) => (
+                <li key={issue}>{issue}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+
+        <div className="admin-form-grid">
+          <label className="admin-toggle">
+            <input
+              type="checkbox"
+              checked={notificationForm.email?.ativo}
+              onChange={(event) => updateNotificationNested('email', 'ativo', event.target.checked)}
+            />
+            <span>Ativar e-mail</span>
+          </label>
+
+          <label className="admin-field">
+            <span>E-mail de destino</span>
+            <input
+              className="admin-input"
+              type="email"
+              value={notificationForm.email?.destino || ''}
+              onChange={(event) => updateNotificationNested('email', 'destino', event.target.value)}
+              placeholder="pedidos@decoratie.com.br"
+              autoComplete="off"
+            />
+          </label>
+
+          <label className="admin-toggle">
+            <input
+              type="checkbox"
+              checked={notificationForm.whatsapp?.ativo}
+              onChange={(event) => updateNotificationNested('whatsapp', 'ativo', event.target.checked)}
+            />
+            <span>Ativar WhatsApp</span>
+          </label>
+
+          <label className="admin-field">
+            <span>WhatsApp de destino</span>
+            <input
+              className="admin-input"
+              value={notificationForm.whatsapp?.destino || ''}
+              onChange={(event) => updateNotificationNested('whatsapp', 'destino', event.target.value)}
+              placeholder="Ex.: 48999999999"
+              autoComplete="off"
+            />
+            <small className="admin-field-hint">
+              O envio real depende do provedor configurado nas variaveis de ambiente da Function.
+            </small>
+          </label>
+        </div>
+
+        <div className="admin-freight-audit">
+          <strong>Status do backend</strong>
+          <div className="admin-freight-audit-grid">
+            <span>E-mail: {notificationForm.status?.emailProviderConfigured ? 'Provedor configurado' : 'Sem provedor'}</span>
+            <span>WhatsApp: {notificationForm.status?.whatsappProviderConfigured ? 'Provedor configurado' : 'Sem provedor'}</span>
+            <span>Ultima atualizacao: {formatDateTime(notificationForm.updatedAt)}</span>
+          </div>
+        </div>
+
+        <div className="admin-form-actions">
+          <button
+            type="submit"
+            className="admin-btn"
+            disabled={notificationSaving || notificationLoading}
+          >
+            {notificationSaving ? 'Salvando notificacoes...' : 'Salvar notificacoes'}
           </button>
         </div>
       </form>
