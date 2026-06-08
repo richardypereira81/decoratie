@@ -1,5 +1,6 @@
 import { memo } from 'react'
 import { formatCurrency } from '../../shared/formatters.js'
+import { getInstallmentLabel } from '../../shared/pricing.js'
 import { getPrimaryProductCategory } from '../../shared/productCategories.js'
 import { BellIcon, CartIcon } from './StoreIcons.jsx'
 
@@ -55,7 +56,10 @@ function ProductCard({ product, onProductClick, onAddToCart }) {
         <h3 className="store-card-name">{product.nome}</h3>
         <div className="store-card-pricing">
           {hasDiscount && <span className="store-card-old-price">{formatCurrency(originalPrice)}</span>}
-          <p className="store-card-price">{formatCurrency(price)}</p>
+          <div className="store-card-price-row">
+            <p className="store-card-price">{formatCurrency(price)}</p>
+            {hasStock ? <small>{getInstallmentLabel(price)}</small> : null}
+          </div>
           {hasStock && <span className="store-card-pix">5% off no Pix</span>}
         </div>
 

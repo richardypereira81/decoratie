@@ -60,16 +60,6 @@ export function OperationIcon(props) {
   )
 }
 
-export function LeadsIcon(props) {
-  return (
-    <IconBase {...props}>
-      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2Z" />
-      <path d="M8 9h8" />
-      <path d="M8 13h5" />
-    </IconBase>
-  )
-}
-
 export function SettingsIcon(props) {
   return (
     <IconBase {...props}>
@@ -241,6 +231,32 @@ export function OrdersIcon(props) {
       <path d="M8 13h8" />
       <path d="M8 17h8" />
       <path d="M8 9h2" />
+    </IconBase>
+  )
+}
+
+export function CalendarIcon(props) {
+  return (
+    <IconBase {...props}>
+      <path d="M7 3v4" />
+      <path d="M17 3v4" />
+      <path d="M4 8h16" />
+      <rect x="4" y="5" width="16" height="16" rx="2" />
+      <path d="M8 12h2" />
+      <path d="M14 12h2" />
+      <path d="M8 16h2" />
+      <path d="M14 16h2" />
+    </IconBase>
+  )
+}
+
+export function CouponIcon(props) {
+  return (
+    <IconBase {...props}>
+      <path d="M4 8a2 2 0 0 0 2-2h12a2 2 0 0 0 2 2v8a2 2 0 0 0-2 2H6a2 2 0 0 0-2-2Z" />
+      <path d="M9 9h.01" />
+      <path d="M15 15h.01" />
+      <path d="m15 9-6 6" />
     </IconBase>
   )
 }

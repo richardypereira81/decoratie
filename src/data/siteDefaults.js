@@ -33,6 +33,7 @@ export const defaultSettings = {
   vipGroupLink: '#',
   ctaDefaultText: 'Quero conhecer',
   systemStatus: 'online',
+  googleCseId: '637ade0665cab421b',
   brandTagline: 'Peças exclusivas que transformam momentos simples em memórias inesquecíveis.',
 }
 

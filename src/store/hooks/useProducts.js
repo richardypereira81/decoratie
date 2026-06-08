@@ -2,6 +2,7 @@ import { useDeferredValue, useEffect, useMemo, useState } from 'react'
 import { collection, onSnapshot } from 'firebase/firestore'
 import { db } from '../../lib/firebaseClient.js'
 import { normalizeProductCategories, productMatchesCategory } from '../../shared/productCategories.js'
+import { isProductStoreVisible } from '../../shared/productVisibility.js'
 
 export function useProducts() {
   const [products, setProducts] = useState([])
@@ -16,7 +17,7 @@ export function useProducts() {
     const unsubProducts = onSnapshot(collection(db, 'produtos'), (snap) => {
       const items = snap.docs
         .map((d) => ({ id: d.id, ...d.data() }))
-        .filter((p) => p.ativo !== false)
+        .filter(isProductStoreVisible)
       setProducts(items)
       setLoading(false)
     })

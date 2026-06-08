@@ -8,6 +8,7 @@ const {stringify} = require("csv-stringify/sync");
 const ExcelJS = require("exceljs");
 const PDFDocument = require("pdfkit");
 const functions = require("firebase-functions/v1");
+const nodemailer = require("nodemailer");
 
 if (!admin.apps.length) {
   admin.initializeApp();
@@ -15,6 +16,7 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 const app = express();
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const xmlParser = new XMLParser({
   ignoreAttributes: false,
@@ -121,6 +123,115 @@ function createHttpError(statusCode, code, message, details = null) {
   error.code = code;
   error.details = details;
   return error;
+}
+
+function normalizeCouponCode(value) {
+  return String(value || "").trim().toUpperCase();
+}
+
+function isValidCouponCode(value) {
+  return /^[A-Z0-9]+$/.test(normalizeCouponCode(value));
+}
+
+function normalizeCustomerEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function normalizeCustomerCpf(value) {
+  return onlyDigits(value);
+}
+
+function hashStableKey(value) {
+  return crypto
+      .createHash("sha256")
+      .update(String(value || ""))
+      .digest("hex")
+      .slice(0, 32);
+}
+
+function getCustomerIdentity(cliente = {}) {
+  const email = normalizeCustomerEmail(cliente.email);
+  const cpf = normalizeCustomerCpf(
+      cliente.cpfNormalizado ||
+      cliente.documentoLimpo ||
+      cliente.documento ||
+      cliente.cpf,
+  );
+
+  return {
+    email,
+    cpf,
+  };
+}
+
+function getCustomerKeyDocId(type, value) {
+  return `${type}_${hashStableKey(value)}`;
+}
+
+function getCustomerDocId(identity = {}) {
+  if (identity.email) {
+    return getCustomerKeyDocId("email", identity.email);
+  }
+
+  if (identity.cpf) {
+    return getCustomerKeyDocId("cpf", identity.cpf);
+  }
+
+  return "";
+}
+
+function getCouponUsageKeyDocId(codigo, type, value) {
+  return `${normalizeCouponCode(codigo)}_${type}_${hashStableKey(value)}`;
+}
+
+function getCouponUsageKeyRefs(codigo, identity = {}) {
+  const refs = [];
+
+  if (identity.cpf) {
+    refs.push({
+      type: "cpf",
+      value: identity.cpf,
+      ref: db.collection("cupomUsoChaves")
+          .doc(getCouponUsageKeyDocId(codigo, "cpf", identity.cpf)),
+    });
+  }
+
+  if (identity.email) {
+    refs.push({
+      type: "email",
+      value: identity.email,
+      ref: db.collection("cupomUsoChaves")
+          .doc(getCouponUsageKeyDocId(codigo, "email", identity.email)),
+    });
+  }
+
+  return refs;
+}
+
+function createCouponAlreadyUsedError(details = null) {
+  return createHttpError(
+      409,
+      "cupom_ja_utilizado",
+      "Este cupom já foi utilizado por este CPF ou e-mail.",
+      details,
+  );
+}
+
+function createCouponUnavailableError(error) {
+  if (["cupom_ja_utilizado", "cupom_cliente_obrigatorio"].includes(error?.code)) {
+    return error;
+  }
+
+  return createHttpError(
+      error?.statusCode || 409,
+      "pedido_cupom_indisponivel",
+      "O cupom aplicado nao esta mais disponivel. Remova ou escolha outro cupom para continuar.",
+      {
+        code: error?.code || "cupom_indisponivel",
+        message: error?.message || "",
+        details: error?.details || null,
+      },
+  );
 }
 
 function parseOptionalNumber(value) {
@@ -238,6 +349,7 @@ const DEFAULT_ORDER_NOTIFICATIONS_CONFIG = {
   email: {
     ativo: false,
     destino: "",
+    remetente: "",
   },
   whatsapp: {
     ativo: false,
@@ -246,6 +358,21 @@ const DEFAULT_ORDER_NOTIFICATIONS_CONFIG = {
 };
 
 const ORDER_NOTIFICATION_LOCK_TTL_MS = 2 * 60 * 1000;
+const PIX_DISCOUNT_PERCENT = 5;
+const PENDING_PAYMENT_AUTO_CANCEL_MS = 24 * 60 * 60 * 1000;
+const PENDING_PAYMENT_AUTO_CANCEL_HOURS = 24;
+const PENDING_PAYMENT_AUTO_CANCEL_BATCH_LIMIT = 200;
+const PENDING_PAYMENT_ORDER_STATUSES = new Set([
+  "aguardando_pagamento",
+  "pagamento_pendente",
+]);
+const COMPLETED_PAYMENT_STATUSES = new Set([
+  "approved",
+  "pago",
+  "aprovado",
+  "authorized",
+]);
+const AUTO_CANCEL_PAYMENT_REASON = "pagamento_pendente_24h";
 
 const MELHOR_ENVIO_OAUTH_SCOPES = [
   "shipping-calculate",
@@ -644,8 +771,38 @@ function getEnvValue(name, configPath = "") {
   ).trim();
 }
 
+function getPublicAssetUrl(assetPath) {
+  const baseUrl = (
+    getEnvValue("EMAIL_ASSET_BASE_URL", "email.asset_base_url") ||
+    getEnvValue("APP_PUBLIC_URL", "app.public_url") ||
+    "https://decoratie.app"
+  ).replace(/\/+$/, "");
+  const encodedPath = String(assetPath || "")
+      .split("/")
+      .map((part) => encodeURIComponent(part))
+      .join("/");
+
+  return `${baseUrl}/${encodedPath}`;
+}
+
+function getEmailLogoUrl() {
+  return getEnvValue("EMAIL_LOGO_URL", "email.logo_url") ||
+    getPublicAssetUrl("email-logo.png");
+}
+
 function normalizeNotificationEmail(value) {
   return String(value || "").trim().toLowerCase();
+}
+
+function normalizeNotificationEmailFrom(value, fallbackEmail = "") {
+  const raw = String(value || "").trim();
+
+  if (raw) {
+    return raw;
+  }
+
+  const email = normalizeNotificationEmail(fallbackEmail);
+  return email ? `Decoratie <${email}>` : "";
 }
 
 function normalizeNotificationPhone(value) {
@@ -678,6 +835,10 @@ function normalizeOrderNotificationConfig(data = {}) {
     email: {
       ativo: Boolean(email.ativo),
       destino: normalizeNotificationEmail(email.destino),
+      remetente: normalizeNotificationEmailFrom(
+          email.remetente || source.emailFrom,
+          email.destino,
+      ),
     },
     whatsapp: {
       ativo: Boolean(whatsapp.ativo),
@@ -688,12 +849,15 @@ function normalizeOrderNotificationConfig(data = {}) {
   };
 }
 
-function getEmailNotificationProviderConfig() {
+function getEmailNotificationProviderConfig(config = null) {
   const resendApiKey = getEnvValue(
       "ORDER_NOTIFICATION_RESEND_API_KEY",
       "notificacoes_pedido.resend_api_key",
   ) || getEnvValue("RESEND_API_KEY", "resend.api_key");
-  const from = getEnvValue(
+  const from = normalizeNotificationEmailFrom(
+      config?.email?.remetente,
+      config?.email?.destino,
+  ) || getEnvValue(
       "ORDER_NOTIFICATION_EMAIL_FROM",
       "notificacoes_pedido.email_from",
   );
@@ -741,7 +905,7 @@ function sanitizeOrderNotificationConfigForAdmin(config) {
   return {
     ...config,
     status: {
-      emailProviderConfigured: getEmailNotificationProviderConfig().configured,
+      emailProviderConfigured: getEmailNotificationProviderConfig(config).configured,
       whatsappProviderConfigured: getWhatsappNotificationProviderConfig().configured,
     },
   };
@@ -766,8 +930,21 @@ function validateOrderNotificationConfig(config) {
   ) {
     throw createHttpError(
         422,
-        "notificacao_email_invalido",
-        "Informe um e-mail de destino valido.",
+      "notificacao_email_invalido",
+      "Informe um e-mail de destino valido.",
+    );
+  }
+
+  if (
+    config.email.ativo &&
+    config.email.remetente &&
+    !/<[^@\s]+@[^@\s]+\.[^@\s]+>$/.test(config.email.remetente) &&
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(config.email.remetente)
+  ) {
+    throw createHttpError(
+        422,
+        "notificacao_remetente_invalido",
+        "Informe um remetente de e-mail valido.",
     );
   }
 
@@ -2390,6 +2567,7 @@ function normalizeOrderItemsForCreate(value = []) {
   return value.map((item) => {
     const quantity = Math.max(1, Number.parseInt(item?.quantidade, 10) || 1);
     const price = round2(item?.preco);
+    const produtoId = String(item?.produtoId || "").trim();
 
     if (!Number.isFinite(price) || price < 0) {
       throw createHttpError(
@@ -2400,19 +2578,45 @@ function normalizeOrderItemsForCreate(value = []) {
       );
     }
 
+    if (!produtoId || produtoId.includes("/")) {
+      throw createHttpError(
+          422,
+          "pedido_item_invalido",
+          "Um produto do pedido possui identificador invalido.",
+          {produtoId: item?.produtoId || null},
+      );
+    }
+
     return {
-      produtoId: String(item?.produtoId || "").trim(),
+      produtoId,
       nome: String(item?.nome || "Produto").trim(),
       preco: price,
       quantidade: quantity,
       imagem: String(item?.imagem || "").trim(),
+      variacaoId: String(
+          item?.variacaoId ?? item?.variationId ?? "",
+      ).trim(),
+      skuId: String(item?.skuId ?? item?.sku ?? "").trim(),
+      variacaoNome: String(
+          item?.variacaoNome ?? item?.variationName ?? "",
+      ).trim(),
+      skuNome: String(item?.skuNome ?? item?.skuName ?? "").trim(),
     };
   });
 }
 
 function normalizeOrderPayloadForCreate(data = {}) {
   const subtotal = round2(data.subtotal);
+  const discount = round2(data.desconto ?? data.discount ?? 0);
+  const discountPercent = Number(data.descontoPercentual ?? data.discountPercent ?? 0);
+  const totalSemDesconto = round2(data.totalSemDesconto);
   const total = round2(data.total);
+  const cupomCodigo = normalizeCouponCode(
+      data.cupomCodigo ||
+      data.cupom?.codigo ||
+      data.couponCode ||
+      data.coupon?.codigo,
+  );
 
   if (!Number.isFinite(total) || total < 0) {
     throw createHttpError(
@@ -2427,6 +2631,14 @@ function normalizeOrderPayloadForCreate(data = {}) {
     itens: normalizeOrderItemsForCreate(data.itens),
     frete: isPlainObject(data.frete) ? data.frete : null,
     subtotal: Number.isFinite(subtotal) ? subtotal : 0,
+    desconto: Number.isFinite(discount) && discount > 0 ? discount : 0,
+    descontoPercentual: Number.isFinite(discountPercent) && discountPercent > 0 ?
+      discountPercent :
+      0,
+    totalSemDesconto: Number.isFinite(totalSemDesconto) && totalSemDesconto >= 0 ?
+      totalSemDesconto :
+      total,
+    cupomCodigo,
     total,
     status: normalizeOrderStatusForCreate(data.status),
     pagamento: isPlainObject(data.pagamento) ? data.pagamento : null,
@@ -2438,14 +2650,1307 @@ function normalizeOrderPayloadForCreate(data = {}) {
   };
 }
 
+function getCouponPercentual(value) {
+  const percentual = Number(value);
+  return Number.isFinite(percentual) ? percentual : 0;
+}
+
+function sanitizeCouponForOrder(codigo, data = {}, valorDesconto = 0) {
+  const percentual = getCouponPercentual(data.percentual);
+
+  return {
+    codigo,
+    descricao: String(data.descricao || "").trim(),
+    tipo: "porcentagem",
+    percentual,
+    valorDesconto: round2(valorDesconto),
+  };
+}
+
+function getCouponStartDate(coupon = {}) {
+  return toDate(coupon.dataInicio || coupon.inicio || coupon.startsAt);
+}
+
+function getCouponEndDate(coupon = {}) {
+  return toDate(
+      coupon.dataValidade ||
+      coupon.validade ||
+      coupon.dataFim ||
+      coupon.endsAt,
+  );
+}
+
+function assertCouponCodeValid(codigo) {
+  if (!codigo || !isValidCouponCode(codigo)) {
+    throw createHttpError(
+        422,
+        "cupom_codigo_invalido",
+        "Informe um cupom valido.",
+    );
+  }
+}
+
+function assertCouponSnapshotValid(snapshot, codigo, now = new Date()) {
+  assertCouponCodeValid(codigo);
+
+  if (!snapshot?.exists) {
+    throw createHttpError(
+        404,
+        "cupom_nao_encontrado",
+        "Cupom nao encontrado.",
+    );
+  }
+
+  const coupon = snapshot.data() || {};
+  const tipo = String(coupon.tipo || "porcentagem").trim();
+  const percentual = getCouponPercentual(coupon.percentual);
+  const startDate = getCouponStartDate(coupon);
+  const endDate = getCouponEndDate(coupon);
+
+  if (coupon.ativo !== true) {
+    throw createHttpError(
+        409,
+        "cupom_indisponivel",
+        "Este cupom nao esta disponivel.",
+    );
+  }
+
+  if (tipo !== "porcentagem" || percentual <= 0 || percentual > 100) {
+    throw createHttpError(
+        422,
+        "cupom_percentual_invalido",
+        "Este cupom esta com configuracao invalida.",
+    );
+  }
+
+  if (startDate && now.getTime() < startDate.getTime()) {
+    throw createHttpError(
+        409,
+        "cupom_nao_iniciado",
+        "Este cupom ainda nao esta disponivel.",
+    );
+  }
+
+  if (!endDate || now.getTime() > endDate.getTime()) {
+    throw createHttpError(
+        409,
+        "cupom_expirado",
+        "Este cupom expirou.",
+    );
+  }
+
+  return {
+    id: snapshot.id,
+    ...coupon,
+    codigo,
+    tipo: "porcentagem",
+    percentual,
+  };
+}
+
+function calculateCouponOrderDiscount(subtotal, coupon = null) {
+  if (!coupon) {
+    return 0;
+  }
+
+  const subtotalValue = Math.max(0, round2(subtotal));
+  const percentual = Math.min(100, Math.max(0, getCouponPercentual(coupon.percentual)));
+
+  if (!subtotalValue || !percentual) {
+    return 0;
+  }
+
+  return Math.min(subtotalValue, round2(subtotalValue * (percentual / 100)));
+}
+
+function getCouponRef(codigo) {
+  return db.collection("cupons").doc(normalizeCouponCode(codigo));
+}
+
+async function assertCouponNotUsedByIdentity(codigo, identity = {}) {
+  const refs = getCouponUsageKeyRefs(codigo, identity);
+
+  if (!refs.length) {
+    throw createHttpError(
+        422,
+        "cupom_cliente_obrigatorio",
+        "Informe CPF ou e-mail para aplicar o cupom.",
+    );
+  }
+
+  const snapshots = await Promise.all(refs.map((item) => item.ref.get()));
+  const usedSnapshot = snapshots.find((snapshot) => snapshot.exists);
+
+  if (usedSnapshot) {
+    throw createCouponAlreadyUsedError({codigo});
+  }
+}
+
+async function readCouponUsageKeySnapshots(transaction, codigo, identity = {}) {
+  const refs = getCouponUsageKeyRefs(codigo, identity);
+  const snapshots = [];
+
+  for (const item of refs) {
+    snapshots.push({
+      ...item,
+      snapshot: await transaction.get(item.ref),
+    });
+  }
+
+  return snapshots;
+}
+
+function assertCouponUsageSnapshotsAvailable(items = [], pedidoId = "") {
+  if (!items.length) {
+    throw createHttpError(
+        422,
+        "cupom_cliente_obrigatorio",
+        "Informe CPF ou e-mail para aplicar o cupom.",
+    );
+  }
+
+  const conflictingItem = items.find((item) => {
+    if (!item.snapshot.exists) {
+      return false;
+    }
+
+    const data = item.snapshot.data() || {};
+    return String(data.pedidoId || "") !== String(pedidoId || "");
+  });
+
+  if (conflictingItem) {
+    throw createCouponAlreadyUsedError({
+      codigoCupom: conflictingItem.snapshot.data()?.codigoCupom || "",
+      tipo: conflictingItem.type,
+    });
+  }
+}
+
+function buildCustomerPayload({cliente = {}, pedidoId = "", orderTotal = 0} = {}) {
+  const identity = getCustomerIdentity(cliente);
+  const endereco = isPlainObject(cliente.endereco) ? cliente.endereco : {};
+
+  return {
+    nome: String(cliente.nome || "").trim(),
+    email: identity.email,
+    cpfNormalizado: identity.cpf,
+    documento: String(cliente.documento || "").trim(),
+    documentoLimpo: identity.cpf,
+    tipoDocumento: String(cliente.tipoDocumento || "").trim(),
+    telefone: String(cliente.telefone || "").trim(),
+    endereco: {
+      cep: String(endereco.cep || "").trim(),
+      rua: String(endereco.rua || "").trim(),
+      numero: String(endereco.numero || "").trim(),
+      complemento: String(endereco.complemento || "").trim(),
+      bairro: String(endereco.bairro || "").trim(),
+      cidade: String(endereco.cidade || "").trim(),
+      estado: String(endereco.estado || "").trim(),
+    },
+    ultimoPedidoId: String(pedidoId || ""),
+    ultimoPedidoTotal: round2(orderTotal),
+    dataAtualizacao: admin.firestore.FieldValue.serverTimestamp(),
+  };
+}
+
+async function readCustomerLookupInTransaction(transaction, cliente = {}) {
+  const identity = getCustomerIdentity(cliente);
+  const keyItems = [];
+
+  if (identity.email) {
+    keyItems.push({
+      type: "email",
+      value: identity.email,
+      ref: db.collection("clienteChaves")
+          .doc(getCustomerKeyDocId("email", identity.email)),
+    });
+  }
+
+  if (identity.cpf) {
+    keyItems.push({
+      type: "cpf",
+      value: identity.cpf,
+      ref: db.collection("clienteChaves")
+          .doc(getCustomerKeyDocId("cpf", identity.cpf)),
+    });
+  }
+
+  const keySnapshots = [];
+
+  for (const item of keyItems) {
+    keySnapshots.push({
+      ...item,
+      snapshot: await transaction.get(item.ref),
+    });
+  }
+
+  const existingClienteId = keySnapshots
+      .map((item) => String(item.snapshot.data()?.clienteId || ""))
+      .find(Boolean);
+  const clienteId = existingClienteId || getCustomerDocId(identity) ||
+    db.collection("clientes").doc().id;
+  const clienteRef = db.collection("clientes").doc(clienteId);
+  const clienteSnapshot = await transaction.get(clienteRef);
+
+  return {
+    identity,
+    clienteId,
+    clienteRef,
+    clienteSnapshot,
+    keySnapshots,
+  };
+}
+
+function writeCustomerInTransaction({
+  transaction,
+  lookup,
+  cliente,
+  pedidoId,
+  orderTotal = 0,
+}) {
+  if (!lookup?.clienteId) {
+    return "";
+  }
+
+  const payload = buildCustomerPayload({cliente, pedidoId, orderTotal});
+  const createdFields = lookup.clienteSnapshot.exists ? {} : {
+    dataCriacao: admin.firestore.FieldValue.serverTimestamp(),
+    totalPedidos: 0,
+    totalPedidosPagos: 0,
+    valorTotalComprado: 0,
+  };
+
+  transaction.set(lookup.clienteRef, {
+    ...createdFields,
+    ...payload,
+  }, {merge: true});
+
+  lookup.keySnapshots.forEach((item) => {
+    transaction.set(item.ref, {
+      tipo: item.type,
+      valor: item.value,
+      clienteId: lookup.clienteId,
+      atualizadoEm: admin.firestore.FieldValue.serverTimestamp(),
+      criadoEm: item.snapshot.exists ?
+        item.snapshot.data()?.criadoEm || admin.firestore.FieldValue.serverTimestamp() :
+        admin.firestore.FieldValue.serverTimestamp(),
+    }, {merge: true});
+  });
+
+  return lookup.clienteId;
+}
+
+function isApprovedOrderForCustomerSideEffects(order = {}) {
+  const orderStatus = String(order.status || "").trim().toLowerCase();
+  const paymentStatus = getPaymentStatusValue(order);
+
+  return orderStatus === "pago" ||
+    orderStatus === "aprovado" ||
+    COMPLETED_PAYMENT_STATUSES.has(paymentStatus);
+}
+
+function getOrderCouponDiscountValue(order = {}) {
+  const coupon = isPlainObject(order.cupom) ? order.cupom : {};
+  const value = Number(coupon.valorDesconto ?? order.valorDescontoCupom ?? 0);
+
+  return Number.isFinite(value) && value > 0 ? round2(value) : 0;
+}
+
+function getOrderApprovedAt(order = {}) {
+  return toDate(
+      order.pagamento?.approvedAt ||
+      order.pagamento?.date_approved ||
+      order.pagamento?.updatedAt ||
+      order.updatedAt,
+  );
+}
+
+function writeCustomerApprovalInTransaction({
+  transaction,
+  lookup,
+  cliente,
+  pedidoId,
+  orderTotal,
+  approvedAt,
+}) {
+  if (!lookup?.clienteId) {
+    return "";
+  }
+
+  const payload = buildCustomerPayload({cliente, pedidoId, orderTotal});
+
+  transaction.set(lookup.clienteRef, {
+    ...payload,
+    ultimoPedidoAprovadoId: String(pedidoId || ""),
+    ultimoPedidoAprovadoEm: approvedAt ?
+      admin.firestore.Timestamp.fromDate(approvedAt) :
+      admin.firestore.FieldValue.serverTimestamp(),
+    totalPedidosPagos: admin.firestore.FieldValue.increment(1),
+    valorTotalComprado: admin.firestore.FieldValue.increment(round2(orderTotal)),
+    dataAtualizacao: admin.firestore.FieldValue.serverTimestamp(),
+  }, {merge: true});
+
+  lookup.keySnapshots.forEach((item) => {
+    transaction.set(item.ref, {
+      tipo: item.type,
+      valor: item.value,
+      clienteId: lookup.clienteId,
+      atualizadoEm: admin.firestore.FieldValue.serverTimestamp(),
+      criadoEm: item.snapshot.exists ?
+        item.snapshot.data()?.criadoEm || admin.firestore.FieldValue.serverTimestamp() :
+        admin.firestore.FieldValue.serverTimestamp(),
+    }, {merge: true});
+  });
+
+  return lookup.clienteId;
+}
+
+function buildCouponUsagePayload({
+  pedidoId,
+  order,
+  clienteId,
+  identity,
+  approvedAt,
+}) {
+  const coupon = isPlainObject(order.cupom) ? order.cupom : {};
+  const codigoCupom = normalizeCouponCode(coupon.codigo || order.cupomCodigo);
+  const valorDesconto = getOrderCouponDiscountValue(order);
+
+  return {
+    cupomId: codigoCupom,
+    codigoCupom,
+    pedidoId,
+    clienteId: clienteId || order.clienteId || null,
+    cpf: identity.cpf || "",
+    email: identity.email || "",
+    cpfNormalizado: identity.cpf || "",
+    emailNormalizado: identity.email || "",
+    dataUso: admin.firestore.FieldValue.serverTimestamp(),
+    valorDesconto,
+    totalPedido: round2(order.totalFinal ?? order.total ?? 0),
+    statusPagamento: getPaymentStatusValue(order) || String(order.status || ""),
+    dataAprovacaoPagamento: approvedAt ?
+      admin.firestore.Timestamp.fromDate(approvedAt) :
+      admin.firestore.FieldValue.serverTimestamp(),
+  };
+}
+
+async function processApprovedOrderSideEffects(pedidoId) {
+  const orderRef = db.collection("pedidos").doc(pedidoId);
+
+  try {
+    await db.runTransaction(async (transaction) => {
+      const orderSnapshot = await transaction.get(orderRef);
+
+      if (!orderSnapshot.exists) {
+        return;
+      }
+
+      const order = orderSnapshot.data() || {};
+
+      if (!isApprovedOrderForCustomerSideEffects(order)) {
+        return;
+      }
+
+      const identity = getCustomerIdentity(order.cliente);
+      const customerLookup = order.clientePagamentoRegistrado ?
+        null :
+        await readCustomerLookupInTransaction(transaction, order.cliente);
+      const codigoCupom = normalizeCouponCode(order.cupom?.codigo || order.cupomCodigo);
+      const couponDiscount = getOrderCouponDiscountValue(order);
+      const shouldRegisterCoupon = Boolean(
+          codigoCupom &&
+          couponDiscount > 0 &&
+          order.cupomUsoRegistrado !== true,
+      );
+      let couponUsageRef = null;
+      let couponUsageSnapshot = null;
+      let couponUsageKeySnapshots = [];
+
+      if (shouldRegisterCoupon) {
+        couponUsageRef = db.collection("cupomUsos").doc(pedidoId);
+        couponUsageSnapshot = await transaction.get(couponUsageRef);
+        couponUsageKeySnapshots = await readCouponUsageKeySnapshots(
+            transaction,
+            codigoCupom,
+            identity,
+        );
+        assertCouponUsageSnapshotsAvailable(couponUsageKeySnapshots, pedidoId);
+      }
+
+      const approvedAt = getOrderApprovedAt(order);
+      const orderUpdate = {
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      };
+
+      if (!order.clientePagamentoRegistrado && customerLookup) {
+        const clienteId = writeCustomerApprovalInTransaction({
+          transaction,
+          lookup: customerLookup,
+          cliente: order.cliente,
+          pedidoId,
+          orderTotal: order.totalFinal ?? order.total ?? 0,
+          approvedAt,
+        });
+        orderUpdate.clienteId = order.clienteId || clienteId;
+        orderUpdate.clientePagamentoRegistrado = true;
+        orderUpdate.clientePagamentoRegistradoEm =
+          admin.firestore.FieldValue.serverTimestamp();
+      }
+
+      if (shouldRegisterCoupon) {
+        const clienteId = orderUpdate.clienteId || order.clienteId ||
+          customerLookup?.clienteId ||
+          "";
+        const usagePayload = buildCouponUsagePayload({
+          pedidoId,
+          order,
+          clienteId,
+          identity,
+          approvedAt,
+        });
+
+        if (!couponUsageSnapshot.exists) {
+          transaction.set(couponUsageRef, usagePayload, {merge: true});
+        }
+
+        couponUsageKeySnapshots.forEach((item) => {
+          transaction.set(item.ref, {
+            cupomId: codigoCupom,
+            codigoCupom,
+            pedidoId,
+            clienteId: clienteId || null,
+            tipo: item.type,
+            valor: item.value,
+            dataUso: admin.firestore.FieldValue.serverTimestamp(),
+          }, {merge: true});
+        });
+
+        orderUpdate.cupomUsoRegistrado = true;
+        orderUpdate.cupomUsoRegistradoEm =
+          admin.firestore.FieldValue.serverTimestamp();
+        orderUpdate.cupomUsoErro = admin.firestore.FieldValue.delete();
+      }
+
+      if (
+        orderUpdate.clientePagamentoRegistrado ||
+        orderUpdate.cupomUsoRegistrado
+      ) {
+        transaction.set(orderRef, orderUpdate, {merge: true});
+      }
+    });
+  } catch (error) {
+    await orderRef.set({
+      cupomUsoErro: error.message || "Nao foi possivel registrar uso do cupom.",
+      cupomUsoErroCodigo: error.code || "cupom_uso_erro",
+      cupomUsoErroEm: admin.firestore.FieldValue.serverTimestamp(),
+    }, {merge: true}).catch(() => null);
+    throw error;
+  }
+}
+
+function sanitizeCustomerForCheckout(data = {}) {
+  const endereco = isPlainObject(data.endereco) ? data.endereco : {};
+
+  return {
+    nome: String(data.nome || "").trim(),
+    email: normalizeCustomerEmail(data.email),
+    documento: String(data.documento || "").trim(),
+    documentoLimpo: normalizeCustomerCpf(
+        data.documentoLimpo ||
+        data.cpfNormalizado ||
+        data.documento ||
+        data.cpf,
+    ),
+    tipoDocumento: String(data.tipoDocumento || "").trim(),
+    telefone: String(data.telefone || "").trim(),
+    endereco: {
+      cep: String(endereco.cep || "").trim(),
+      rua: String(endereco.rua || "").trim(),
+      numero: String(endereco.numero || "").trim(),
+      complemento: String(endereco.complemento || "").trim(),
+      bairro: String(endereco.bairro || "").trim(),
+      cidade: String(endereco.cidade || "").trim(),
+      estado: String(endereco.estado || "").trim(),
+    },
+  };
+}
+
+async function findCustomerByEmail(email) {
+  const normalizedEmail = normalizeCustomerEmail(email);
+
+  if (!normalizedEmail) {
+    return null;
+  }
+
+  const keySnapshot = await db.collection("clienteChaves")
+      .doc(getCustomerKeyDocId("email", normalizedEmail))
+      .get();
+  const keyClienteId = String(keySnapshot.data()?.clienteId || "").trim();
+
+  if (keyClienteId) {
+    const customerSnapshot = await db.collection("clientes")
+        .doc(keyClienteId)
+        .get();
+
+    if (customerSnapshot.exists) {
+      return {
+        id: customerSnapshot.id,
+        ...sanitizeCustomerForCheckout(customerSnapshot.data() || {}),
+      };
+    }
+  }
+
+  const querySnapshot = await db.collection("clientes")
+      .where("email", "==", normalizedEmail)
+      .limit(1)
+      .get();
+
+  if (querySnapshot.empty) {
+    return null;
+  }
+
+  const customerSnapshot = querySnapshot.docs[0];
+
+  return {
+    id: customerSnapshot.id,
+    ...sanitizeCustomerForCheckout(customerSnapshot.data() || {}),
+  };
+}
+
+const STOCK_UNIT_ARRAY_FIELDS = [
+  "variacoes",
+  "variantes",
+  "variations",
+  "skus",
+  "skuOptions",
+];
+
+const STOCK_UNIT_ID_FIELDS = [
+  "id",
+  "skuId",
+  "variacaoId",
+  "variationId",
+  "codigo",
+  "codigoProduto",
+  "sku",
+];
+
+const STOCK_VALUE_FIELDS = [
+  "estoque",
+  "stock",
+  "quantidadeDisponivel",
+  "availableQuantity",
+  "quantidade",
+];
+
+function getOrderItemUnitCandidates(item = {}) {
+  return [
+    item.variacaoId,
+    item.skuId,
+  ]
+      .map((value) => String(value || "").trim())
+      .filter(Boolean);
+}
+
+function getOrderItemGroupKey(item = {}) {
+  const unitKey = getOrderItemUnitCandidates(item).join("|");
+  return `${item.produtoId}::${unitKey}`;
+}
+
+function groupOrderItemsForStock(items = []) {
+  const groups = new Map();
+
+  for (const item of items) {
+    const key = getOrderItemGroupKey(item);
+    const existing = groups.get(key);
+
+    if (existing) {
+      existing.quantidade += item.quantidade;
+      existing.item = {
+        ...existing.item,
+        quantidade: existing.quantidade,
+      };
+      continue;
+    }
+
+    groups.set(key, {
+      key,
+      item: {...item},
+      quantidade: item.quantidade,
+    });
+  }
+
+  return Array.from(groups.values());
+}
+
+function getProductStockUnitLists(product = {}) {
+  return STOCK_UNIT_ARRAY_FIELDS
+      .filter((field) => Array.isArray(product[field]))
+      .map((field) => ({
+        field,
+        items: product[field],
+      }))
+      .filter((list) => list.items.length > 0);
+}
+
+function stockUnitMatchesCandidates(unit, candidates) {
+  if (!isPlainObject(unit)) {
+    return false;
+  }
+
+  return STOCK_UNIT_ID_FIELDS.some((field) => {
+    const value = String(unit[field] || "").trim();
+    return value && candidates.includes(value);
+  });
+}
+
+function resolveProductStockTarget(product, item) {
+  const candidates = getOrderItemUnitCandidates(item);
+  const unitLists = getProductStockUnitLists(product);
+
+  if (candidates.length === 0) {
+    if (unitLists.length > 0) {
+      return {issue: "sku_invalido"};
+    }
+
+    return {type: "product"};
+  }
+
+  for (const list of unitLists) {
+    const unitIndex = list.items.findIndex((unit) =>
+      stockUnitMatchesCandidates(unit, candidates),
+    );
+
+    if (unitIndex >= 0) {
+      return {
+        type: "unit",
+        field: list.field,
+        items: list.items,
+        unitIndex,
+        unit: list.items[unitIndex],
+      };
+    }
+  }
+
+  return {issue: "sku_invalido"};
+}
+
+function getStockFieldName(entity = {}) {
+  const matchedField = STOCK_VALUE_FIELDS.find((field) => {
+    const value = Number(entity[field]);
+    return Number.isFinite(value);
+  });
+
+  return matchedField || "estoque";
+}
+
+function getStockNumber(entity = {}) {
+  for (const field of STOCK_VALUE_FIELDS) {
+    const value = Number(entity[field]);
+
+    if (Number.isFinite(value)) {
+      return value;
+    }
+  }
+
+  return null;
+}
+
+function isStockControlled(entity = {}, parent = null) {
+  if (parent?.controlarEstoque === false) {
+    return false;
+  }
+
+  if (entity?.controlarEstoque === false) {
+    return false;
+  }
+
+  if (entity?.controlarEstoque === true) {
+    return true;
+  }
+
+  if (getStockNumber(entity) !== null) {
+    return true;
+  }
+
+  return parent?.controlarEstoque === true;
+}
+
+function shouldUseParentStockForUnit(unit = {}, product = {}) {
+  return unit.controlarEstoque !== true &&
+    unit.controlarEstoque !== false &&
+    getStockNumber(unit) === null &&
+    getStockNumber(product) !== null;
+}
+
+function getAvailableStock(entity = {}) {
+  const stock = getStockNumber(entity);
+  return stock === null ? 0 : Math.max(0, Math.floor(stock));
+}
+
+function isProductUnavailable(product = {}) {
+  return product.ativo === false ||
+    product.removido === true ||
+    product.removed === true ||
+    product.deleted === true ||
+    product.excluido === true;
+}
+
+function getStockIssueMessage(nome, motivo, disponivel) {
+  if (motivo === "estoque_insuficiente" && disponivel > 0) {
+    return `${nome}: disponivel apenas ${disponivel} unidade(s).`;
+  }
+
+  if (motivo === "estoque_insuficiente") {
+    return `${nome}: estoque esgotou enquanto voce finalizava o carrinho.`;
+  }
+
+  if (motivo === "sku_invalido") {
+    return `${nome}: variacao ou SKU invalido.`;
+  }
+
+  if (motivo === "produto_inativo") {
+    return `${nome}: produto inativo no catalogo.`;
+  }
+
+  return `${nome}: produto indisponivel no catalogo.`;
+}
+
+function buildStockIssue(group, motivo, disponivel = 0) {
+  const item = group.item || {};
+  const available = Math.max(0, Math.floor(Number(disponivel) || 0));
+  const nome = String(item.nome || "Produto").trim() || "Produto";
+
+  return {
+    key: group.key,
+    produtoId: item.produtoId,
+    variacaoId: item.variacaoId || "",
+    skuId: item.skuId || "",
+    nome,
+    motivo,
+    mensagem: getStockIssueMessage(nome, motivo, available),
+    quantidadeSolicitada: group.quantidade,
+    disponivel: available,
+    acao: available > 0 && motivo === "estoque_insuficiente" ?
+      "ajustar" :
+      "remover",
+  };
+}
+
+function buildUpdatedCartForStockIssues(groups, issues) {
+  const issueByKey = new Map(issues.map((issue) => [issue.key, issue]));
+
+  return groups
+      .map((group) => {
+        const issue = issueByKey.get(group.key);
+
+        if (!issue) {
+          return {
+            ...group.item,
+            quantidade: group.quantidade,
+          };
+        }
+
+        const nextQuantity = Math.min(group.quantidade, issue.disponivel);
+
+        if (nextQuantity < 1) {
+          return null;
+        }
+
+        return {
+          ...group.item,
+          quantidade: nextQuantity,
+        };
+      })
+      .filter(Boolean);
+}
+
+function toPublicStockIssue(issue) {
+  return {
+    produtoId: issue.produtoId,
+    variacaoId: issue.variacaoId,
+    skuId: issue.skuId,
+    nome: issue.nome,
+    motivo: issue.motivo,
+    mensagem: issue.mensagem,
+    quantidadeSolicitada: issue.quantidadeSolicitada,
+    disponivel: issue.disponivel,
+    acao: issue.acao,
+  };
+}
+
+function createProductStockState(snapshot) {
+  return {
+    ref: snapshot.ref,
+    data: snapshot.data() || {},
+    updates: {},
+  };
+}
+
+function applyProductStockDecrease(state, quantity, recordUpdate = true) {
+  const field = getStockFieldName(state.data);
+  const currentStock = getStockNumber(state.data) || 0;
+  const nextStock = Math.max(0, currentStock - quantity);
+
+  state.data = {
+    ...state.data,
+    [field]: nextStock,
+  };
+
+  if (recordUpdate) {
+    state.updates[field] = nextStock;
+  }
+}
+
+function applyUnitStockDecrease(state, target, quantity, recordUpdate = true) {
+  const field = getStockFieldName(target.unit);
+  const currentStock = getStockNumber(target.unit) || 0;
+  const nextStock = Math.max(0, currentStock - quantity);
+  const nextUnit = {
+    ...target.unit,
+    [field]: nextStock,
+  };
+  const nextItems = target.items.map((unit, index) =>
+    index === target.unitIndex ? nextUnit : unit,
+  );
+
+  state.data = {
+    ...state.data,
+    [target.field]: nextItems,
+  };
+
+  if (recordUpdate) {
+    state.updates[target.field] = nextItems;
+  }
+}
+
+function applyProductStockIncrease(state, quantity) {
+  const field = getStockFieldName(state.data);
+  const currentStock = getStockNumber(state.data) || 0;
+  const nextStock = currentStock + quantity;
+
+  state.data = {
+    ...state.data,
+    [field]: nextStock,
+  };
+  state.updates[field] = nextStock;
+}
+
+function applyUnitStockIncrease(state, target, quantity) {
+  const field = getStockFieldName(target.unit);
+  const currentStock = getStockNumber(target.unit) || 0;
+  const nextStock = currentStock + quantity;
+  const nextUnit = {
+    ...target.unit,
+    [field]: nextStock,
+  };
+  const nextItems = target.items.map((unit, index) =>
+    index === target.unitIndex ? nextUnit : unit,
+  );
+
+  state.data = {
+    ...state.data,
+    [target.field]: nextItems,
+  };
+  state.updates[target.field] = nextItems;
+}
+
+function buildStockUpdatesOrThrow(itemGroups, productSnapshots, options = {}) {
+  const states = new Map();
+  const issues = [];
+  const recordStockUpdate = options.recordStockUpdate !== false;
+
+  for (const group of itemGroups) {
+    const productId = group.item.produtoId;
+    const snapshot = productSnapshots.get(productId);
+
+    if (!snapshot?.exists) {
+      issues.push(buildStockIssue(group, "produto_indisponivel"));
+      continue;
+    }
+
+    if (!states.has(productId)) {
+      states.set(productId, createProductStockState(snapshot));
+    }
+
+    const state = states.get(productId);
+
+    if (isProductUnavailable(state.data)) {
+      issues.push(buildStockIssue(group, "produto_inativo"));
+      continue;
+    }
+
+    const target = resolveProductStockTarget(state.data, group.item);
+
+    if (target.issue) {
+      issues.push(buildStockIssue(group, target.issue));
+      continue;
+    }
+
+    const useParentStock = target.type === "unit" &&
+      shouldUseParentStockForUnit(target.unit, state.data);
+    const entity = target.type === "unit" && !useParentStock ?
+      target.unit :
+      state.data;
+    const parent = target.type === "unit" && !useParentStock ? state.data : null;
+
+    if (!isStockControlled(entity, parent)) {
+      continue;
+    }
+
+    const available = getAvailableStock(entity);
+
+    if (available < group.quantidade) {
+      issues.push(buildStockIssue(
+          group,
+          "estoque_insuficiente",
+          available,
+      ));
+      continue;
+    }
+
+    if (target.type === "unit" && !useParentStock) {
+      applyUnitStockDecrease(
+          state,
+          target,
+          group.quantidade,
+          recordStockUpdate,
+      );
+    } else {
+      applyProductStockDecrease(
+          state,
+          group.quantidade,
+          recordStockUpdate,
+      );
+    }
+  }
+
+  if (issues.length > 0) {
+    throw createHttpError(
+        409,
+        options.errorCode || "pedido_estoque_indisponivel",
+        options.errorMessage ||
+          "Alguns produtos nao estao mais disponiveis nessa quantidade.",
+        {
+          itens: issues.map(toPublicStockIssue),
+          carrinhoAtualizado: buildUpdatedCartForStockIssues(
+              itemGroups,
+              issues,
+          ),
+        },
+    );
+  }
+
+  return Array.from(states.values())
+      .filter((state) => Object.keys(state.updates).length > 0)
+      .map((state) => ({
+        ref: state.ref,
+        data: {
+          ...state.updates,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+      }));
+}
+
+function buildStockRestoreUpdates(itemGroups, productSnapshots) {
+  const states = new Map();
+
+  for (const group of itemGroups) {
+    const productId = group.item.produtoId;
+    const snapshot = productSnapshots.get(productId);
+
+    if (!snapshot?.exists) {
+      continue;
+    }
+
+    if (!states.has(productId)) {
+      states.set(productId, createProductStockState(snapshot));
+    }
+
+    const state = states.get(productId);
+    const target = resolveProductStockTarget(state.data, group.item);
+
+    if (target.issue) {
+      continue;
+    }
+
+    const useParentStock = target.type === "unit" &&
+      shouldUseParentStockForUnit(target.unit, state.data);
+    const entity = target.type === "unit" && !useParentStock ?
+      target.unit :
+      state.data;
+    const parent = target.type === "unit" && !useParentStock ? state.data : null;
+
+    if (!isStockControlled(entity, parent)) {
+      continue;
+    }
+
+    if (target.type === "unit" && !useParentStock) {
+      applyUnitStockIncrease(state, target, group.quantidade);
+    } else {
+      applyProductStockIncrease(state, group.quantidade);
+    }
+  }
+
+  return Array.from(states.values())
+      .filter((state) => Object.keys(state.updates).length > 0)
+      .map((state) => ({
+        ref: state.ref,
+        data: {
+          ...state.updates,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+      }));
+}
+
+function buildValidatedCartItems(itemGroups) {
+  return itemGroups.map((group) => ({
+    ...group.item,
+    quantidade: group.quantidade,
+  }));
+}
+
+async function validateCartStockItems(items) {
+  const itemGroups = groupOrderItemsForStock(items);
+  const productRefs = new Map(itemGroups.map((group) => [
+    group.item.produtoId,
+    db.collection("produtos").doc(group.item.produtoId),
+  ]));
+  let validatedItems = [];
+
+  await db.runTransaction(async (transaction) => {
+    const productSnapshots = new Map();
+
+    for (const [productId, productRef] of productRefs) {
+      productSnapshots.set(productId, await transaction.get(productRef));
+    }
+
+    buildStockUpdatesOrThrow(itemGroups, productSnapshots, {
+      recordStockUpdate: false,
+      errorCode: "carrinho_estoque_indisponivel",
+      errorMessage:
+        "Alguns produtos nao estao mais disponiveis nessa quantidade.",
+    });
+
+    validatedItems = buildValidatedCartItems(itemGroups);
+  });
+
+  return {
+    carrinhoAtualizado: validatedItems,
+  };
+}
+
+function getPaymentStatusValue(order = {}) {
+  return String(
+      order.pagamento?.statusMercadoPago ||
+      order.pagamento?.status ||
+      "",
+  ).trim().toLowerCase();
+}
+
+function isPendingPaymentOrder(order = {}) {
+  const status = String(order.status || "").trim();
+  const paymentStatus = getPaymentStatusValue(order);
+
+  if (!PENDING_PAYMENT_ORDER_STATUSES.has(status)) {
+    return false;
+  }
+
+  return !COMPLETED_PAYMENT_STATUSES.has(paymentStatus);
+}
+
+function getPendingPaymentAutoCancelAt(order = {}) {
+  const explicitDate = toDate(order.pagamentoPendenteCancelarEm);
+
+  if (explicitDate) {
+    return explicitDate;
+  }
+
+  const createdAt = toDate(order.createdAt) || toDate(order.updatedAt);
+
+  if (!createdAt) {
+    return null;
+  }
+
+  return new Date(createdAt.getTime() + PENDING_PAYMENT_AUTO_CANCEL_MS);
+}
+
+function isPendingPaymentAutoCancelExpired(order = {}, now = new Date()) {
+  const cancelAt = getPendingPaymentAutoCancelAt(order);
+
+  return Boolean(cancelAt && cancelAt.getTime() <= now.getTime());
+}
+
+function buildPendingPaymentAutoCancelAt(createdAt) {
+  return admin.firestore.Timestamp.fromMillis(
+      createdAt.toMillis() + PENDING_PAYMENT_AUTO_CANCEL_MS,
+  );
+}
+
+function buildOrderItemsForStockRestore(order = {}) {
+  const items = Array.isArray(order.itens) ? order.itens : [];
+
+  return items
+      .map((item) => ({
+        produtoId: String(item?.produtoId || "").trim(),
+        nome: String(item?.nome || "Produto").trim(),
+        quantidade: Math.max(
+            1,
+            Number.parseInt(item?.quantidade, 10) || 0,
+        ),
+        variacaoId: String(
+            item?.variacaoId ?? item?.variationId ?? "",
+        ).trim(),
+        skuId: String(item?.skuId ?? item?.sku ?? "").trim(),
+      }))
+      .filter((item) => item.produtoId && item.quantidade > 0);
+}
+
+function getProductPriceForOrder(product = {}, item = {}) {
+  const price = round2(product.precoVenda ?? product.preco ?? item.preco);
+
+  if (!Number.isFinite(price) || price <= 0) {
+    throw createHttpError(
+        409,
+        "pedido_item_invalido",
+        "Um item do pedido nao possui preco valido.",
+        {produtoId: item.produtoId || null},
+    );
+  }
+
+  return price;
+}
+
+function calculateOrderItemTotalsFromSnapshots(orderPayload, productSnapshots) {
+  const items = Array.isArray(orderPayload.itens) ? orderPayload.itens : [];
+  let subtotal = 0;
+
+  const pricedItems = items.map((item) => {
+    const productSnapshot = productSnapshots.get(item.produtoId);
+    const product = productSnapshot?.exists ? productSnapshot.data() || {} : {};
+    const quantity = Math.max(1, Number.parseInt(item.quantidade, 10) || 1);
+    const price = getProductPriceForOrder(product, item);
+
+    subtotal += price * quantity;
+
+    return {
+      ...item,
+      nome: String(product.nome || item.nome || "Produto").trim(),
+      preco: price,
+      quantidade: quantity,
+      imagem: String(product.imagem || item.imagem || "").trim(),
+    };
+  });
+
+  return {
+    itens: pricedItems,
+    subtotal: round2(subtotal),
+  };
+}
+
+function buildOrderTotalsPayload({
+  subtotal,
+  frete,
+  coupon = null,
+  paymentMethod = "",
+}) {
+  const subtotalProdutos = round2(subtotal);
+  const valorFrete = round2(frete);
+  const valorDescontoCupom = calculateCouponOrderDiscount(subtotalProdutos, coupon);
+  const cupom = coupon ?
+    sanitizeCouponForOrder(coupon.codigo, coupon, valorDescontoCupom) :
+    null;
+  const totalAntesDescontos = round2(subtotalProdutos + valorFrete);
+  const totalAntesDescontoPix = round2(
+      subtotalProdutos - valorDescontoCupom + valorFrete,
+  );
+  const method = normalizeMercadoPagoMethod(paymentMethod);
+  const descontoPix = calculatePixOrderDiscount(totalAntesDescontoPix, method);
+  const total = Math.max(0, round2(totalAntesDescontoPix - descontoPix));
+  const descontoTotal = round2(valorDescontoCupom + descontoPix);
+
+  return {
+    subtotal: subtotalProdutos,
+    subtotalProdutos,
+    valorFrete,
+    cupom,
+    cupomCodigo: cupom?.codigo || "",
+    valorDescontoCupom,
+    descontoCupomPercentual: cupom?.percentual || 0,
+    desconto: descontoPix,
+    descontoPercentual: descontoPix > 0 ? PIX_DISCOUNT_PERCENT : 0,
+    descontoPix,
+    descontoTotal,
+    totalSemDesconto: totalAntesDescontos,
+    totalAntesDescontos,
+    totalAntesDescontoPix,
+    totalFinal: total,
+    total,
+  };
+}
+
 async function createOrderWithSequence(orderPayload) {
   const counterRef = db.collection("counters").doc("orders");
   const orderRef = db.collection("pedidos").doc();
+  const itemGroups = groupOrderItemsForStock(orderPayload.itens);
+  const productRefs = new Map(itemGroups.map((group) => [
+    group.item.produtoId,
+    db.collection("produtos").doc(group.item.produtoId),
+  ]));
   const initialCounterValue = await getInitialOrderCounterValue();
   let orderNumber = 0;
 
   await db.runTransaction(async (transaction) => {
+    const createdAt = admin.firestore.Timestamp.now();
     const counterSnapshot = await transaction.get(counterRef);
+    const productSnapshots = new Map();
+    const cupomCodigo = normalizeCouponCode(orderPayload.cupomCodigo);
+    const customerLookup = await readCustomerLookupInTransaction(
+        transaction,
+        orderPayload.cliente,
+    );
+    let couponUsageKeySnapshots = [];
+    let couponSnapshot = null;
+    let coupon = null;
+
+    for (const [productId, productRef] of productRefs) {
+      productSnapshots.set(productId, await transaction.get(productRef));
+    }
+
+    if (cupomCodigo) {
+      try {
+        couponSnapshot = await transaction.get(getCouponRef(cupomCodigo));
+        coupon = assertCouponSnapshotValid(
+            couponSnapshot,
+            cupomCodigo,
+            createdAt.toDate(),
+        );
+        couponUsageKeySnapshots = await readCouponUsageKeySnapshots(
+            transaction,
+            cupomCodigo,
+            customerLookup.identity,
+        );
+        assertCouponUsageSnapshotsAvailable(couponUsageKeySnapshots, orderRef.id);
+      } catch (error) {
+        throw createCouponUnavailableError(error);
+      }
+    }
+
+    const stockUpdates = buildStockUpdatesOrThrow(
+        itemGroups,
+        productSnapshots,
+    );
+    const itemTotals = calculateOrderItemTotalsFromSnapshots(
+        orderPayload,
+        productSnapshots,
+    );
+    const totals = buildOrderTotalsPayload({
+      subtotal: itemTotals.subtotal,
+      frete: normalizeOrderFreightAmountForCreate(orderPayload.frete),
+      coupon,
+      paymentMethod: orderPayload.pagamento?.metodo,
+    });
     const lastNumber = Number(
         counterSnapshot.exists ?
           counterSnapshot.data()?.lastNumber || 0 :
@@ -2461,17 +3966,158 @@ async function createOrderWithSequence(orderPayload) {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     }, {merge: true});
 
-    transaction.set(orderRef, {
-      ...orderPayload,
-      orderNumber,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    stockUpdates.forEach((stockUpdate) => {
+      transaction.update(stockUpdate.ref, stockUpdate.data);
     });
+
+    const orderData = {
+      ...orderPayload,
+      ...totals,
+      clienteId: customerLookup.clienteId,
+      itens: itemTotals.itens,
+      pagamento: orderPayload.pagamento ? {
+        ...orderPayload.pagamento,
+        valor: totals.total,
+        desconto: totals.desconto,
+        descontoPercentual: totals.descontoPercentual,
+        descontoPix: totals.descontoPix,
+        valorDescontoCupom: totals.valorDescontoCupom,
+        descontoCupomPercentual: totals.descontoCupomPercentual,
+        descontoTotal: totals.descontoTotal,
+        valorSemDesconto: totals.totalSemDesconto,
+        cupomCodigo: totals.cupomCodigo,
+        cupom: totals.cupom,
+      } : null,
+      orderNumber,
+      createdAt,
+      updatedAt: createdAt,
+    };
+
+    if (isPendingPaymentOrder(orderData)) {
+      orderData.pagamentoPendenteCancelarEm =
+        buildPendingPaymentAutoCancelAt(createdAt);
+    }
+
+    writeCustomerInTransaction({
+      transaction,
+      lookup: customerLookup,
+      cliente: orderPayload.cliente,
+      pedidoId: orderRef.id,
+      orderTotal: totals.total,
+    });
+    transaction.set(orderRef, orderData);
   });
 
   return {
     id: orderRef.id,
     orderNumber,
+  };
+}
+
+async function cancelPendingPaymentOrderIfExpired(pedidoId, now = new Date()) {
+  const orderRef = db.collection("pedidos").doc(pedidoId);
+  let cancelled = false;
+  let restoredItems = 0;
+  let previousStatus = "";
+
+  await db.runTransaction(async (transaction) => {
+    const orderSnapshot = await transaction.get(orderRef);
+
+    if (!orderSnapshot.exists) {
+      return;
+    }
+
+    const order = orderSnapshot.data() || {};
+
+    if (
+      !isPendingPaymentOrder(order) ||
+      !isPendingPaymentAutoCancelExpired(order, now)
+    ) {
+      return;
+    }
+
+    previousStatus = String(order.status || "").trim();
+    const restoreItems = buildOrderItemsForStockRestore(order);
+    const itemGroups = groupOrderItemsForStock(restoreItems);
+    const productRefs = new Map(itemGroups.map((group) => [
+      group.item.produtoId,
+      db.collection("produtos").doc(group.item.produtoId),
+    ]));
+    const productSnapshots = new Map();
+
+    for (const [productId, productRef] of productRefs) {
+      productSnapshots.set(productId, await transaction.get(productRef));
+    }
+
+    const stockUpdates = buildStockRestoreUpdates(itemGroups, productSnapshots);
+
+    stockUpdates.forEach((stockUpdate) => {
+      transaction.update(stockUpdate.ref, stockUpdate.data);
+    });
+
+    restoredItems = itemGroups.reduce(
+        (sum, group) => sum + group.quantidade,
+        0,
+    );
+
+    transaction.set(orderRef, {
+      status: "cancelado",
+      canceladoEm: admin.firestore.FieldValue.serverTimestamp(),
+      pagamentoPendenteCanceladoAutomaticamente: true,
+      pagamentoPendenteCanceladoEm:
+        admin.firestore.FieldValue.serverTimestamp(),
+      cancelamentoAutomatico: {
+        motivo: AUTO_CANCEL_PAYMENT_REASON,
+        prazoHoras: PENDING_PAYMENT_AUTO_CANCEL_HOURS,
+        statusAnterior: previousStatus,
+        pagamentoStatus: getPaymentStatusValue(order),
+        estoqueRestaurado: stockUpdates.length > 0,
+        itensRestaurados: restoredItems,
+        executadoEm: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, {merge: true});
+
+    cancelled = true;
+  });
+
+  return {
+    pedidoId,
+    cancelled,
+    previousStatus,
+    restoredItems,
+  };
+}
+
+async function cancelExpiredPendingPaymentOrders() {
+  const now = new Date();
+  const statuses = Array.from(PENDING_PAYMENT_ORDER_STATUSES);
+  const snapshot = await db.collection("pedidos")
+      .where("status", "in", statuses)
+      .limit(PENDING_PAYMENT_AUTO_CANCEL_BATCH_LIMIT)
+      .get();
+  const candidates = snapshot.docs
+      .map((doc) => ({
+        pedidoId: doc.id,
+        order: doc.data() || {},
+      }))
+      .filter(({order}) => isPendingPaymentAutoCancelExpired(order, now));
+  const results = await Promise.all(candidates.map(({pedidoId}) =>
+    cancelPendingPaymentOrderIfExpired(pedidoId, now),
+  ));
+  const cancelled = results.filter((result) => result.cancelled);
+
+  console.log("[pedidos] cancelamento automatico de pendentes", {
+    checked: snapshot.size,
+    candidates: candidates.length,
+    cancelled: cancelled.length,
+    prazoHoras: PENDING_PAYMENT_AUTO_CANCEL_HOURS,
+  });
+
+  return {
+    checked: snapshot.size,
+    candidates: candidates.length,
+    cancelled: cancelled.length,
   };
 }
 
@@ -3167,6 +4813,10 @@ function buildOrderNotificationSummary({pedidoId, order, adminUrl}) {
       quantidade: toNumber(item?.quantidade),
       valor: toNumber(item?.preco) * toNumber(item?.quantidade),
     })),
+    cupomCodigo: getOrderEmailCouponCode(order),
+    cupomPercentual: getOrderEmailCouponPercent(order),
+    cupomDesconto: getOrderEmailCouponDiscount(order),
+    descontoPix: getOrderEmailDiscount(order),
     total: toNumber(order.total),
     totalFormatado: formatNotificationCurrency(order.total),
     formaPagamento: getOrderPaymentLabel(order.pagamento),
@@ -3200,6 +4850,21 @@ function buildOrderNotificationText(summary) {
     );
   });
 
+  if (summary.cupomCodigo) {
+    lines.push(
+        "",
+        `Cupom: ${summary.cupomCodigo} (${summary.cupomPercentual}%)`,
+    );
+  }
+
+  if (summary.cupomDesconto) {
+    lines.push(`Desconto cupom: ${summary.cupomDesconto}`);
+  }
+
+  if (summary.descontoPix) {
+    lines.push(`Desconto Pix: ${summary.descontoPix}`);
+  }
+
   lines.push("", `Total: ${summary.totalFormatado}`);
 
   if (summary.adminUrl) {
@@ -3229,7 +4894,7 @@ async function postNotificationJson(url, payload, headers = {}) {
 }
 
 async function sendOrderEmailNotification({config, summary, text, to = "", subject = ""}) {
-  const provider = getEmailNotificationProviderConfig();
+  const provider = getEmailNotificationProviderConfig(config);
   const recipient = normalizeNotificationEmail(to || config.email.destino);
   const resolvedSubject = subject || `Decoratie - novo pedido ${summary.pedidoCodigo}`;
 
@@ -3325,6 +4990,824 @@ async function sendOrderWhatsappNotification({config, summary, text, to = ""}) {
   return {sent: true};
 }
 
+function escapeEmailHtml(value) {
+  return String(value ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+}
+
+function emailTextToHtml(value) {
+  return escapeEmailHtml(value).replace(/\n/g, "<br>");
+}
+
+function extractEmailAddress(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/<([^@\s<>]+@[^@\s<>]+\.[^@\s<>]+)>/);
+
+  return normalizeNotificationEmail(match ? match[1] : text);
+}
+
+function formatSmtpFromAddress(config) {
+  const fromEmail = extractEmailAddress(config.fromEmail);
+  const fromName = String(config.fromName || "Decoratie").trim();
+
+  return fromName ? `${fromName} <${fromEmail}>` : fromEmail;
+}
+
+function getLocawebSmtpConfig(notificationConfig = null) {
+  const port = Number(getEnvValue("SMTP_PORT", "smtp.port") || 587);
+  const fallbackFrom = extractEmailAddress(notificationConfig?.email?.remetente) ||
+    normalizeNotificationEmail(notificationConfig?.email?.destino);
+  const fallbackAdminEmail = normalizeNotificationEmail(
+      notificationConfig?.email?.destino,
+  );
+  const fromEmail = normalizeNotificationEmail(
+      getEnvValue("SMTP_FROM_EMAIL", "smtp.from_email"),
+  ) || fallbackFrom;
+  const adminOrderEmail = normalizeNotificationEmail(
+      getEnvValue("ADMIN_ORDER_EMAIL", "smtp.admin_order_email"),
+  ) || fallbackAdminEmail;
+
+  return {
+    host: getEnvValue("SMTP_HOST", "smtp.host") || "smtplw.com.br",
+    port: Number.isFinite(port) && port > 0 ? port : 587,
+    user: getEnvValue("SMTP_USER", "smtp.user"),
+    pass: getEnvValue("SMTP_PASS", "smtp.pass"),
+    fromEmail,
+    fromName: getEnvValue("SMTP_FROM_NAME", "smtp.from_name") || "Decoratie",
+    adminOrderEmail,
+  };
+}
+
+function isLocawebSmtpConfigured(config) {
+  return Boolean(
+      config.host &&
+      config.port &&
+      config.user &&
+      config.pass &&
+      config.fromEmail,
+  );
+}
+
+function createLocawebTransporter(config) {
+  return nodemailer.createTransport({
+    host: config.host,
+    port: Number(config.port || 587),
+    secure: Number(config.port) === 465,
+    requireTLS: Number(config.port) === 587,
+    auth: {
+      user: config.user,
+      pass: config.pass,
+    },
+  });
+}
+
+function sanitizeSmtpError(error, config = {}) {
+  let message = String(error?.message || "Erro ao enviar e-mail SMTP.");
+  const sensitiveValues = [
+    config.pass,
+    getEnvValue("SMTP_PASS", "smtp.pass"),
+  ].filter(Boolean);
+
+  sensitiveValues.forEach((value) => {
+    message = message.split(value).join("[redacted]");
+  });
+
+  return message.slice(0, 1500);
+}
+
+function getOrderEmailCode({pedidoId, order}) {
+  const orderNumber = getValidOrderNumber(order?.orderNumber);
+  return orderNumber ? String(orderNumber) : String(pedidoId || "");
+}
+
+function getOrderEmailDate(order = {}) {
+  const date = toDate(order.createdAt) || toDate(order.updatedAt) || new Date();
+  return new Intl.DateTimeFormat("pt-BR", {
+    dateStyle: "short",
+    timeStyle: "short",
+    timeZone: "America/Sao_Paulo",
+  }).format(date);
+}
+
+function getOrderCustomer(order = {}) {
+  return isPlainObject(order.cliente) ? order.cliente : {};
+}
+
+function getOrderCustomerEmail(order = {}) {
+  return normalizeNotificationEmail(getOrderCustomer(order).email);
+}
+
+function getOrderCustomerName(order = {}) {
+  return String(getOrderCustomer(order).nome || "").trim();
+}
+
+function getOrderEmailItems(order = {}) {
+  return Array.isArray(order.itens) ? order.itens : [];
+}
+
+function getOrderEmailItemVariation(item = {}) {
+  return [
+    item.variacaoNome,
+    item.skuNome,
+    item.variacaoId,
+    item.skuId,
+  ]
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)[0] || "";
+}
+
+function getOrderEmailFreightAmount(order = {}) {
+  const frete = isPlainObject(order.frete) ? order.frete : {};
+  if (frete.valorPendente) {
+    return "A combinar";
+  }
+
+  const value = frete.valorFinal ?? frete.valor ?? null;
+  return value === null || value === undefined || value === "" ?
+    "" :
+    formatNotificationCurrency(value);
+}
+
+function getOrderEmailDiscount(order = {}) {
+  const value = Number(order.desconto ?? order.discount ?? 0);
+  return Number.isFinite(value) && value > 0 ?
+    formatNotificationCurrency(value) :
+    "";
+}
+
+function getOrderCoupon(order = {}) {
+  return isPlainObject(order.cupom) ? order.cupom : null;
+}
+
+function getOrderEmailCouponCode(order = {}) {
+  return String(
+      getOrderCoupon(order)?.codigo ||
+      order.cupomCodigo ||
+      "",
+  ).trim();
+}
+
+function getOrderEmailCouponPercent(order = {}) {
+  const value = Number(
+      getOrderCoupon(order)?.percentual ??
+      order.descontoCupomPercentual ??
+      0,
+  );
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function getOrderEmailCouponDiscount(order = {}) {
+  const value = Number(
+      getOrderCoupon(order)?.valorDesconto ??
+      order.valorDescontoCupom ??
+      0,
+  );
+  return Number.isFinite(value) && value > 0 ?
+    formatNotificationCurrency(value) :
+    "";
+}
+
+function getOrderEmailTrackingCode(order = {}) {
+  return getOrderTrackingCode(order);
+}
+
+function buildOrderEmailSummary({pedidoId, order}) {
+  const cliente = getOrderCustomer(order);
+  const frete = isPlainObject(order.frete) ? order.frete : {};
+  const itens = getOrderEmailItems(order);
+  const subtotal = typeof order.subtotal === "number" ?
+    order.subtotal :
+    itens.reduce((sum, item) => {
+      return sum + (toNumber(item.preco) * toNumber(item.quantidade));
+    }, 0);
+
+  return {
+    pedidoId,
+    pedidoCodigo: getOrderEmailCode({pedidoId, order}),
+    dataPedido: getOrderEmailDate(order),
+    clienteNome: String(cliente.nome || "").trim(),
+    clienteEmail: normalizeNotificationEmail(cliente.email),
+    clienteTelefone: String(cliente.telefone || "").trim(),
+    enderecoEntrega: formatOrderAddress(cliente.endereco),
+    formaPagamento: getOrderPaymentLabel(order.pagamento),
+    status: getOrderReportStatusLabel(order.status),
+    statusRaw: String(order.status || "").trim(),
+    subtotal: formatNotificationCurrency(subtotal),
+    frete: getOrderEmailFreightAmount(order),
+    cupomCodigo: getOrderEmailCouponCode(order),
+    cupomPercentual: getOrderEmailCouponPercent(order),
+    cupomDesconto: getOrderEmailCouponDiscount(order),
+    descontoPix: getOrderEmailDiscount(order),
+    total: formatNotificationCurrency(order.total),
+    observacoes: String(
+        order.observacoes ||
+        order.observacao ||
+        order.cliente?.observacoes ||
+        "",
+    ).trim(),
+    trackingCode: getOrderEmailTrackingCode(order),
+    entrega: getOrderEntregaRetiradaLabel(frete),
+    itens: itens.map((item) => {
+      const quantidade = Math.max(1, Number.parseInt(item.quantidade, 10) || 1);
+      const preco = toNumber(item.preco);
+
+      return {
+        nome: String(item.nome || "Produto").trim(),
+        variacao: getOrderEmailItemVariation(item),
+        quantidade,
+        precoUnitario: formatNotificationCurrency(preco),
+        subtotal: formatNotificationCurrency(preco * quantidade),
+      };
+    }),
+  };
+}
+
+function buildEmailItemsText(summary) {
+  if (!summary.itens.length) {
+    return "- Nenhum item informado.";
+  }
+
+  return summary.itens.map((item) => {
+    const variation = item.variacao ? ` (${item.variacao})` : "";
+    return [
+      `- ${item.quantidade}x ${item.nome}${variation}`,
+      `  Unitario: ${item.precoUnitario}`,
+      `  Subtotal: ${item.subtotal}`,
+    ].join("\n");
+  }).join("\n");
+}
+
+function renderEmailLayout({title, preheader = "", childrenHtml = ""}) {
+  const logoUrl = getEmailLogoUrl();
+
+  return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>${escapeEmailHtml(title)}</title>
+  </head>
+  <body style="margin:0;background:#f7f4f0;color:#2a2a2a;font-family:Arial,sans-serif;">
+    <span style="display:none!important;opacity:0;height:0;width:0;overflow:hidden;">
+      ${escapeEmailHtml(preheader)}
+    </span>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f7f4f0;padding:24px 12px;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:640px;background:#fffdf9;border:1px solid #e5ddd3;border-radius:18px;overflow:hidden;">
+            <tr>
+              <td style="padding:22px 24px;background:#55756f;color:#ffffff;">
+                <div style="display:inline-block;max-width:190px;padding:8px 10px;background:#fffdf9;border-radius:12px;">
+                  <img src="${escapeEmailHtml(logoUrl)}" width="170" alt="Decoratie" style="display:block;width:170px;max-width:100%;height:auto;border:0;outline:none;text-decoration:none;">
+                </div>
+                <h1 style="margin:14px 0 0;font-size:24px;line-height:1.2;font-family:Georgia,serif;font-weight:500;">${escapeEmailHtml(title)}</h1>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:24px;">
+                ${childrenHtml}
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:18px 24px;background:#edf2ef;color:#55756f;font-size:13px;line-height:1.5;">
+                Com carinho,<br><strong>Equipe Decoratie</strong>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>`;
+}
+
+function renderEmailRows(rows) {
+  return rows
+      .filter((row) => row.value !== "" && row.value !== null && row.value !== undefined)
+      .map((row) => `
+        <tr>
+          <td style="padding:8px 0;color:#6d7b76;font-size:13px;">${escapeEmailHtml(row.label)}</td>
+          <td style="padding:8px 0;color:#2a2a2a;font-size:13px;text-align:right;font-weight:700;">${escapeEmailHtml(row.value)}</td>
+        </tr>
+      `).join("");
+}
+
+function renderEmailItemsTable(summary) {
+  const rows = summary.itens.map((item) => `
+    <tr>
+      <td style="padding:10px 0;border-top:1px solid #eee5dc;">
+        <strong style="display:block;color:#2a2a2a;font-size:14px;">${escapeEmailHtml(item.nome)}</strong>
+        ${item.variacao ? `<span style="color:#6d7b76;font-size:12px;">${escapeEmailHtml(item.variacao)}</span>` : ""}
+      </td>
+      <td style="padding:10px 0;border-top:1px solid #eee5dc;text-align:center;color:#2a2a2a;">${escapeEmailHtml(item.quantidade)}</td>
+      <td style="padding:10px 0;border-top:1px solid #eee5dc;text-align:right;color:#2a2a2a;">${escapeEmailHtml(item.precoUnitario)}</td>
+      <td style="padding:10px 0;border-top:1px solid #eee5dc;text-align:right;color:#2a2a2a;font-weight:700;">${escapeEmailHtml(item.subtotal)}</td>
+    </tr>
+  `).join("");
+
+  return `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-top:14px;">
+      <thead>
+        <tr>
+          <th align="left" style="padding:0 0 8px;color:#55756f;font-size:12px;">Produto</th>
+          <th align="center" style="padding:0 0 8px;color:#55756f;font-size:12px;">Qtd</th>
+          <th align="right" style="padding:0 0 8px;color:#55756f;font-size:12px;">Unit.</th>
+          <th align="right" style="padding:0 0 8px;color:#55756f;font-size:12px;">Subtotal</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+}
+
+function buildAdminOrderCreatedEmail(summary) {
+  const text = [
+    "Novo pedido recebido - Decoratie",
+    "",
+    `Pedido: ${summary.pedidoCodigo}`,
+    `Data/hora: ${summary.dataPedido}`,
+    `Cliente: ${summary.clienteNome || "Nao informado"}`,
+    `E-mail: ${summary.clienteEmail || "Nao informado"}`,
+    `Telefone: ${summary.clienteTelefone || "Nao informado"}`,
+    `Endereco: ${summary.enderecoEntrega || "Nao informado"}`,
+    `Entrega/retirada: ${summary.entrega || "Nao informado"}`,
+    `Pagamento: ${summary.formaPagamento || "Nao informado"}`,
+    `Status inicial: ${summary.status}`,
+    "",
+    "Itens:",
+    buildEmailItemsText(summary),
+    "",
+    `Subtotal: ${summary.subtotal}`,
+    summary.cupomCodigo ?
+      `Cupom: ${summary.cupomCodigo} (${summary.cupomPercentual}%)` :
+      "",
+    summary.cupomDesconto ? `Desconto cupom: ${summary.cupomDesconto}` : "",
+    summary.frete ? `Frete: ${summary.frete}` : "",
+    summary.descontoPix ? `Desconto Pix: ${summary.descontoPix}` : "",
+    `Total: ${summary.total}`,
+    summary.observacoes ? `Observacoes: ${summary.observacoes}` : "",
+  ].filter(Boolean).join("\n");
+  const html = renderEmailLayout({
+    title: "Novo pedido recebido",
+    preheader: `Pedido ${summary.pedidoCodigo} - ${summary.total}`,
+    childrenHtml: `
+      <p style="margin:0 0 16px;color:#2a2a2a;font-size:15px;line-height:1.6;">
+        Um novo pedido foi recebido na loja.
+      </p>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+        ${renderEmailRows([
+          {label: "Pedido", value: summary.pedidoCodigo},
+          {label: "Data/hora", value: summary.dataPedido},
+          {label: "Cliente", value: summary.clienteNome || "Nao informado"},
+          {label: "E-mail", value: summary.clienteEmail || "Nao informado"},
+          {label: "Telefone", value: summary.clienteTelefone || "Nao informado"},
+          {label: "Endereco", value: summary.enderecoEntrega || "Nao informado"},
+          {label: "Entrega/retirada", value: summary.entrega || "Nao informado"},
+          {label: "Pagamento", value: summary.formaPagamento || "Nao informado"},
+          {label: "Status", value: summary.status},
+        ])}
+      </table>
+      ${renderEmailItemsTable(summary)}
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-top:16px;">
+        ${renderEmailRows([
+          {label: "Subtotal", value: summary.subtotal},
+          {
+            label: "Cupom",
+            value: summary.cupomCodigo ?
+              `${summary.cupomCodigo} (${summary.cupomPercentual}%)` :
+              "",
+          },
+          {label: "Desconto cupom", value: summary.cupomDesconto},
+          {label: "Frete", value: summary.frete},
+          {label: "Desconto Pix", value: summary.descontoPix},
+          {label: "Total", value: summary.total},
+          {label: "Observacoes", value: summary.observacoes},
+        ])}
+      </table>
+    `,
+  });
+
+  return {
+    subject: "Novo pedido recebido - Decoratie",
+    text,
+    html,
+  };
+}
+
+function buildCustomerOrderCreatedEmail(summary) {
+  const name = summary.clienteNome || "cliente";
+  const text = [
+    `Ola, ${name}!`,
+    "",
+    "Recebemos o seu pedido com sucesso e estamos muito felizes com a sua compra.",
+    "Agora nossa equipe ira conferir tudo com carinho e te manteremos informado sobre cada etapa do pedido.",
+    "",
+    "Resumo do pedido:",
+    `- Numero do pedido: ${summary.pedidoCodigo}`,
+    `- Data: ${summary.dataPedido}`,
+    summary.cupomCodigo ?
+      `- Cupom: ${summary.cupomCodigo} (${summary.cupomPercentual}%)` :
+      "",
+    summary.cupomDesconto ? `- Desconto cupom: ${summary.cupomDesconto}` : "",
+    `- Total: ${summary.total}`,
+    `- Status: ${summary.status}`,
+    "",
+    "Itens:",
+    buildEmailItemsText(summary),
+    "",
+    "Muito obrigado por comprar com a Decoratie.",
+    "",
+    "Com carinho,",
+    "Equipe Decoratie",
+  ].join("\n");
+  const html = renderEmailLayout({
+    title: "Recebemos seu pedido",
+    preheader: `Pedido ${summary.pedidoCodigo} recebido pela Decoratie`,
+    childrenHtml: `
+      <p style="margin:0 0 12px;color:#2a2a2a;font-size:15px;line-height:1.6;">Ola, ${escapeEmailHtml(name)}!</p>
+      <p style="margin:0 0 16px;color:#2a2a2a;font-size:15px;line-height:1.6;">
+        Recebemos o seu pedido com sucesso e estamos muito felizes com a sua compra.
+        Agora nossa equipe ira conferir tudo com carinho e te manteremos informado sobre cada etapa.
+      </p>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;background:#f8f5f1;border-radius:12px;padding:8px;">
+        ${renderEmailRows([
+          {label: "Pedido", value: summary.pedidoCodigo},
+          {label: "Data", value: summary.dataPedido},
+          {
+            label: "Cupom",
+            value: summary.cupomCodigo ?
+              `${summary.cupomCodigo} (${summary.cupomPercentual}%)` :
+              "",
+          },
+          {label: "Desconto cupom", value: summary.cupomDesconto},
+          {label: "Status", value: summary.status},
+          {label: "Total", value: summary.total},
+        ])}
+      </table>
+      ${renderEmailItemsTable(summary)}
+      <p style="margin:18px 0 0;color:#6d7b76;font-size:14px;line-height:1.6;">
+        Muito obrigado por comprar com a Decoratie.
+      </p>
+    `,
+  });
+
+  return {
+    subject: "Recebemos seu pedido - Decoratie",
+    text,
+    html,
+  };
+}
+
+function getOrderStatusCustomerMessage(status, order = {}) {
+  const trackingCode = getOrderEmailTrackingCode(order);
+  const messages = {
+    pendente: "Recebemos o seu pedido e vamos iniciar a conferencia.",
+    recebido: "Recebemos o seu pedido e vamos iniciar a conferencia.",
+    aguardando_pagamento: "Recebemos o seu pedido e estamos aguardando a confirmacao do pagamento.",
+    pagamento_pendente: "Estamos aguardando a confirmacao do pagamento.",
+    pagamento_recusado: "O pagamento foi recusado. Voce pode tentar outra forma de pagamento.",
+    pago: "Seu pedido foi confirmado com sucesso.",
+    confirmado: "Seu pedido foi confirmado com sucesso.",
+    em_analise: "Seu pedido esta em analise pela nossa equipe.",
+    em_separacao: "Seu pedido ja esta sendo separado com carinho pela nossa equipe.",
+    enviado: trackingCode ?
+      `Seu pedido foi enviado. Codigo de rastreio: ${trackingCode}.` :
+      "Seu pedido foi enviado.",
+    entregue: "Seu pedido foi entregue. Esperamos que voce ame sua compra.",
+    cancelado: "Seu pedido foi cancelado. Caso tenha duvidas, entre em contato conosco.",
+  };
+
+  return messages[status] || "Temos uma nova atualizacao sobre o seu pedido.";
+}
+
+function buildCustomerStatusChangedEmail({summary, oldStatus, newStatus, order}) {
+  const name = summary.clienteNome || "cliente";
+  const oldLabel = getOrderReportStatusLabel(oldStatus);
+  const newLabel = getOrderReportStatusLabel(newStatus);
+  const customMessage = getOrderStatusCustomerMessage(newStatus, order);
+  const text = [
+    `Ola, ${name}!`,
+    "",
+    `Temos uma atualizacao sobre o seu pedido ${summary.pedidoCodigo}.`,
+    "",
+    `Status anterior: ${oldLabel}`,
+    `Novo status: ${newLabel}`,
+    "",
+    customMessage,
+    "",
+    "Obrigado por comprar com a Decoratie.",
+    "",
+    "Com carinho,",
+    "Equipe Decoratie",
+  ].join("\n");
+  const html = renderEmailLayout({
+    title: "Atualizacao do seu pedido",
+    preheader: `Pedido ${summary.pedidoCodigo}: ${newLabel}`,
+    childrenHtml: `
+      <p style="margin:0 0 12px;color:#2a2a2a;font-size:15px;line-height:1.6;">Ola, ${escapeEmailHtml(name)}!</p>
+      <p style="margin:0 0 16px;color:#2a2a2a;font-size:15px;line-height:1.6;">
+        Temos uma atualizacao sobre o seu pedido <strong>${escapeEmailHtml(summary.pedidoCodigo)}</strong>.
+      </p>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;background:#f8f5f1;border-radius:12px;padding:8px;">
+        ${renderEmailRows([
+          {label: "Status anterior", value: oldLabel},
+          {label: "Novo status", value: newLabel},
+        ])}
+      </table>
+      <p style="margin:18px 0 0;color:#2a2a2a;font-size:15px;line-height:1.6;">
+        ${emailTextToHtml(customMessage)}
+      </p>
+    `,
+  });
+
+  return {
+    subject: "Atualizacao do seu pedido - Decoratie",
+    text,
+    html,
+  };
+}
+
+function normalizeEmailEventId(value) {
+  return String(value || "")
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^a-zA-Z0-9_-]+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 160) || "email_event";
+}
+
+function getOrderEmailLogRef(pedidoId, eventId) {
+  return db
+      .collection("pedidos")
+      .doc(pedidoId)
+      .collection("emailsEnviados")
+      .doc(normalizeEmailEventId(eventId));
+}
+
+async function wasEmailEventAlreadySent({pedidoId, eventId}) {
+  const snapshot = await getOrderEmailLogRef(pedidoId, eventId).get();
+  return snapshot.exists && snapshot.data()?.sucesso === true;
+}
+
+async function recordOrderEmailLog({pedidoId, eventId, payload}) {
+  await getOrderEmailLogRef(pedidoId, eventId).set({
+    provider: "locaweb_smtp",
+    ...payload,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    dataEnvio: admin.firestore.FieldValue.serverTimestamp(),
+  }, {merge: true});
+}
+
+async function sendLocawebOrderEmail({
+  pedidoId,
+  eventId,
+  tipo,
+  to,
+  subject,
+  text,
+  html,
+  meta = {},
+}) {
+  const notificationConfig = await loadOrderNotificationConfig();
+  const smtpConfig = getLocawebSmtpConfig(notificationConfig);
+  const recipient = normalizeNotificationEmail(to);
+
+  if (await wasEmailEventAlreadySent({pedidoId, eventId})) {
+    return {sent: false, skipped: "already_sent"};
+  }
+
+  if (!recipient) {
+    await recordOrderEmailLog({
+      pedidoId,
+      eventId,
+      payload: {
+        tipo,
+        enviadoPara: "",
+        sucesso: false,
+        motivo: "email_destinatario_invalido",
+        ...meta,
+      },
+    });
+    return {sent: false, reason: "email_destinatario_invalido"};
+  }
+
+  if (!isLocawebSmtpConfigured(smtpConfig)) {
+    await recordOrderEmailLog({
+      pedidoId,
+      eventId,
+      payload: {
+        tipo,
+        enviadoPara: recipient,
+        sucesso: false,
+        motivo: "smtp_nao_configurado",
+        ...meta,
+      },
+    });
+    return {sent: false, reason: "smtp_nao_configurado"};
+  }
+
+  try {
+    const transporter = createLocawebTransporter(smtpConfig);
+    const fromAddress = formatSmtpFromAddress(smtpConfig);
+    await transporter.sendMail({
+      from: fromAddress,
+      sender: fromAddress,
+      replyTo: fromAddress,
+      envelope: {
+        from: smtpConfig.fromEmail,
+        to: recipient,
+      },
+      to: recipient,
+      subject,
+      text,
+      html,
+    });
+    await recordOrderEmailLog({
+      pedidoId,
+      eventId,
+      payload: {
+        tipo,
+        enviadoPara: recipient,
+        remetente: smtpConfig.fromEmail,
+        assunto: subject,
+        sucesso: true,
+        erro: admin.firestore.FieldValue.delete(),
+        motivo: admin.firestore.FieldValue.delete(),
+        ...meta,
+      },
+    });
+    return {sent: true};
+  } catch (error) {
+    const sanitizedError = sanitizeSmtpError(error, smtpConfig);
+    console.error("[smtp_locaweb] falha ao enviar e-mail", {
+      pedidoId,
+      tipo,
+      to: recipient,
+      message: sanitizedError,
+    });
+    await recordOrderEmailLog({
+      pedidoId,
+      eventId,
+      payload: {
+        tipo,
+        enviadoPara: recipient,
+        assunto: subject,
+        sucesso: false,
+        erro: sanitizedError,
+        ...meta,
+      },
+    });
+    return {sent: false, reason: sanitizedError};
+  }
+}
+
+async function sendOrderCreatedSmtpEmails({pedidoId, order, eventId}) {
+  const notificationConfig = await loadOrderNotificationConfig();
+  const smtpConfig = getLocawebSmtpConfig(notificationConfig);
+  const summary = buildOrderEmailSummary({pedidoId, order});
+  const adminEmail = buildAdminOrderCreatedEmail(summary);
+  const customerEmail = buildCustomerOrderCreatedEmail(summary);
+
+  await Promise.all([
+    sendLocawebOrderEmail({
+      pedidoId,
+      eventId: `${eventId}_pedido_criado_admin`,
+      tipo: "pedido_criado_admin",
+      to: smtpConfig.adminOrderEmail,
+      subject: adminEmail.subject,
+      text: adminEmail.text,
+      html: adminEmail.html,
+    }),
+    sendLocawebOrderEmail({
+      pedidoId,
+      eventId: `${eventId}_pedido_criado_cliente`,
+      tipo: "pedido_criado_cliente",
+      to: summary.clienteEmail,
+      subject: customerEmail.subject,
+      text: customerEmail.text,
+      html: customerEmail.html,
+    }),
+  ]);
+}
+
+async function sendOrderAdminSmtpNotification({
+  pedidoId,
+  order,
+  eventId,
+  triggeredBy = "",
+}) {
+  const notificationConfig = await loadOrderNotificationConfig();
+  const smtpConfig = getLocawebSmtpConfig(notificationConfig);
+  const summary = buildOrderEmailSummary({pedidoId, order});
+  const adminEmail = buildAdminOrderCreatedEmail(summary);
+
+  return sendLocawebOrderEmail({
+    pedidoId,
+    eventId: `${eventId}_pedido_criado_admin`,
+    tipo: "pedido_criado_admin",
+    to: smtpConfig.adminOrderEmail,
+    subject: adminEmail.subject,
+    text: adminEmail.text,
+    html: adminEmail.html,
+    meta: {
+      reenviado: true,
+      reenviadoPor: String(triggeredBy || "admin").slice(0, 200),
+    },
+  });
+}
+
+async function sendOrderStatusChangedSmtpEmail({
+  pedidoId,
+  order,
+  oldStatus,
+  newStatus,
+  eventId,
+}) {
+  const summary = buildOrderEmailSummary({pedidoId, order});
+  const customerEmail = buildCustomerStatusChangedEmail({
+    summary,
+    oldStatus,
+    newStatus,
+    order,
+  });
+
+  await sendLocawebOrderEmail({
+    pedidoId,
+    eventId: `${eventId}_status_alterado_cliente`,
+    tipo: "status_alterado",
+    to: summary.clienteEmail,
+    subject: customerEmail.subject,
+    text: customerEmail.text,
+    html: customerEmail.html,
+    meta: {
+      statusAnterior: oldStatus || "",
+      novoStatus: newStatus || "",
+    },
+  });
+}
+
+async function handleOrderEmailAutomation(change, context) {
+  const pedidoId = context.params.pedidoId;
+
+  try {
+    if (!change.after.exists) {
+      return null;
+    }
+
+    const order = change.after.data() || {};
+    const eventId = normalizeEmailEventId(context.eventId || crypto.randomUUID());
+
+    if (!change.before.exists) {
+      if (isApprovedOrderForCustomerSideEffects(order)) {
+        await processApprovedOrderSideEffects(pedidoId);
+      }
+      await sendOrderCreatedSmtpEmails({pedidoId, order, eventId});
+      return null;
+    }
+
+    const previousOrder = change.before.data() || {};
+    const oldStatus = String(previousOrder.status || "").trim();
+    const newStatus = String(order.status || "").trim();
+
+    if (!newStatus || oldStatus === newStatus) {
+      const oldPaymentStatus = getPaymentStatusValue(previousOrder);
+      const newPaymentStatus = getPaymentStatusValue(order);
+
+      if (
+        oldPaymentStatus !== newPaymentStatus &&
+        isApprovedOrderForCustomerSideEffects(order)
+      ) {
+        await processApprovedOrderSideEffects(pedidoId);
+      }
+
+      return null;
+    }
+
+    if (isApprovedOrderForCustomerSideEffects(order)) {
+      await processApprovedOrderSideEffects(pedidoId);
+    }
+
+    await sendOrderStatusChangedSmtpEmail({
+      pedidoId,
+      order,
+      oldStatus,
+      newStatus,
+      eventId,
+    });
+  } catch (error) {
+    console.error("[smtp_locaweb] automacao de e-mail falhou", {
+      pedidoId,
+      message: sanitizeSmtpError(error),
+    });
+  }
+
+  return null;
+}
+
 async function notifyStoreAboutOrder({
   pedidoId,
   notificationToken,
@@ -3332,8 +5815,11 @@ async function notifyStoreAboutOrder({
   force = false,
   requireNotificationToken = true,
   triggeredBy = "",
+  emailMode = "legacy",
 }) {
   const config = await loadOrderNotificationConfig();
+  const smtpConfig = getLocawebSmtpConfig(config);
+  const useSmtpEmail = emailMode === "smtp";
   const orderRef = db.collection("pedidos").doc(pedidoId);
   const lockId = crypto.randomUUID();
   let pending = {email: false, whatsapp: false};
@@ -3377,8 +5863,11 @@ async function notifyStoreAboutOrder({
 
     pending = {
       email: Boolean(
-          config.email.ativo &&
-          config.email.destino &&
+          (
+            useSmtpEmail ?
+              isLocawebSmtpConfigured(smtpConfig) && smtpConfig.adminOrderEmail :
+              config.email.ativo && config.email.destino
+          ) &&
           (force || currentOrder.notificationEmailSent !== true),
       ),
       whatsapp: Boolean(
@@ -3422,7 +5911,14 @@ async function notifyStoreAboutOrder({
 
   if (pending.email) {
     try {
-      const result = await sendOrderEmailNotification({config, summary, text});
+      const result = useSmtpEmail ?
+        await sendOrderAdminSmtpNotification({
+          pedidoId,
+          order,
+          eventId: `manual_${lockId}`,
+          triggeredBy,
+        }) :
+        await sendOrderEmailNotification({config, summary, text});
       emailSent = Boolean(result.sent);
       if (!result.sent) {
         errors.push(`E-mail: ${result.reason || "nao enviado"}`);
@@ -3749,6 +6245,51 @@ function sendOrderCreateError(res, error) {
   });
 }
 
+function sendCartStockValidationError(res, error) {
+  console.error("[carrinho] erro ao validar estoque", {
+    code: error.code || "carrinho_validacao_erro",
+    statusCode: error.statusCode || 500,
+    message: error.message,
+    details: error.details || null,
+  });
+
+  return res.status(error.statusCode || 500).json({
+    erro: error.message || "Nao foi possivel validar o estoque do carrinho.",
+    code: error.code || "carrinho_validacao_erro",
+    details: error.details || null,
+  });
+}
+
+function sendCouponValidationError(res, error) {
+  console.error("[cupons] erro ao validar cupom", {
+    code: error.code || "cupom_validacao_erro",
+    statusCode: error.statusCode || 500,
+    message: error.message,
+    details: error.details || null,
+  });
+
+  return res.status(error.statusCode || 500).json({
+    erro: error.message || "Nao foi possivel validar o cupom.",
+    code: error.code || "cupom_validacao_erro",
+    details: error.details || null,
+  });
+}
+
+function sendCustomerLookupError(res, error) {
+  console.error("[clientes] erro ao buscar cliente", {
+    code: error.code || "cliente_busca_erro",
+    statusCode: error.statusCode || 500,
+    message: error.message,
+    details: error.details || null,
+  });
+
+  return res.status(error.statusCode || 500).json({
+    erro: error.message || "Nao foi possivel buscar o cliente.",
+    code: error.code || "cliente_busca_erro",
+    details: error.details || null,
+  });
+}
+
 function sendFreteError(res, error, config = null) {
   console.error("[frete] erro", {
     code: error.code || "frete_erro",
@@ -3989,6 +6530,18 @@ function normalizeOrderFreightAmount(frete) {
   return round2(amount);
 }
 
+function normalizeOrderFreightAmountForCreate(frete) {
+  if (!frete || frete.valorPendente) {
+    return 0;
+  }
+
+  return normalizeOrderFreightAmount(frete);
+}
+
+function calculatePixOrderDiscount(baseTotal, method) {
+  return method === "pix" ? round2(baseTotal * (PIX_DISCOUNT_PERCENT / 100)) : 0;
+}
+
 async function recalculateOrderTotals(order) {
   const items = Array.isArray(order.itens) ? order.itens : [];
 
@@ -4000,39 +6553,41 @@ async function recalculateOrderTotals(order) {
     );
   }
 
-  const productSnapshots = await Promise.all(
-      items.map((item) => db.collection("produtos")
-          .doc(String(item.produtoId || ""))
-          .get()),
-  );
-  let subtotal = 0;
+  const productSnapshots = new Map(await Promise.all(
+      items.map(async (item) => {
+        const produtoId = String(item.produtoId || "").trim();
+        return [
+          produtoId,
+          await db.collection("produtos").doc(produtoId).get(),
+        ];
+      }),
+  ));
+  const cupomCodigo = normalizeCouponCode(order.cupom?.codigo || order.cupomCodigo);
+  let coupon = null;
 
-  items.forEach((item, index) => {
-    const quantity = Math.max(1, Number.parseInt(item.quantidade, 10) || 1);
-    const product = productSnapshots[index].exists ?
-      productSnapshots[index].data() :
-      {};
-    const unitPrice = round2(product.precoVenda ?? product.preco ?? item.preco);
-
-    if (!Number.isFinite(unitPrice) || unitPrice <= 0) {
-      throw createHttpError(
-          409,
-          "pedido_item_invalido",
-          "Um item do pedido nao possui preco valido.",
-          {produtoId: item.produtoId || null},
-      );
+  if (cupomCodigo) {
+    try {
+      const couponSnapshot = await getCouponRef(cupomCodigo).get();
+      coupon = assertCouponSnapshotValid(couponSnapshot, cupomCodigo, new Date());
+      await assertCouponNotUsedByIdentity(cupomCodigo, getCustomerIdentity(order.cliente));
+    } catch (error) {
+      throw createCouponUnavailableError(error);
     }
-
-    subtotal += unitPrice * quantity;
-  });
+  }
 
   const frete = normalizeOrderFreightAmount(order.frete);
-  const total = round2(subtotal + frete);
+  const itemTotals = calculateOrderItemTotalsFromSnapshots(order, productSnapshots);
+  const totals = buildOrderTotalsPayload({
+    subtotal: itemTotals.subtotal,
+    frete,
+    coupon,
+    paymentMethod: order.pagamento?.metodo,
+  });
 
   return {
-    subtotal: round2(subtotal),
+    ...totals,
     frete,
-    total,
+    itens: itemTotals.itens,
   };
 }
 
@@ -4427,11 +6982,14 @@ async function updateOrderWithMercadoPagoPayment({
       previousEvents :
       [...previousEvents.slice(-19), event];
     const nextStatus = mapMercadoPagoStatusToOrder(paymentRecord.status);
+    const wasAutoCancelled = order.status === "cancelado" &&
+      order.cancelamentoAutomatico?.motivo === AUTO_CANCEL_PAYMENT_REASON;
+    const finalStatus = wasAutoCancelled ? "cancelado" : nextStatus;
 
     updatedOrder = {
       ...order,
       id: pedidoId,
-      status: nextStatus,
+      status: finalStatus,
       pagamento: {
         ...previousPayment,
         ...paymentRecord,
@@ -4441,11 +6999,17 @@ async function updateOrderWithMercadoPagoPayment({
     };
 
     transaction.set(orderRef, {
-      status: nextStatus,
+      status: finalStatus,
       pagamento: updatedOrder.pagamento,
+      pagamentoAtualizadoAposCancelamentoAutomatico:
+        wasAutoCancelled ? true : admin.firestore.FieldValue.delete(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     }, {merge: true});
   });
+
+  if (isApprovedOrderForCustomerSideEffects(updatedOrder)) {
+    await processApprovedOrderSideEffects(pedidoId);
+  }
 
   return updatedOrder;
 }
@@ -5908,6 +8472,7 @@ app.post(
         await db.collection("segredos").doc("notificacoes_pedido").set({
           email: config.email,
           whatsapp: config.whatsapp,
+          emailFrom: config.email.remetente,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           updatedBy: req.adminUser.uid,
         }, {merge: true});
@@ -5924,6 +8489,76 @@ app.post(
     },
 );
 
+app.post("/api/clientes/buscar-por-email", async (req, res) => {
+  try {
+    const body = await obterBodyJson(req);
+    const email = normalizeCustomerEmail(body.email);
+
+    if (!EMAIL_REGEX.test(email)) {
+      throw createHttpError(
+          422,
+          "cliente_email_invalido",
+          "Informe um e-mail valido.",
+      );
+    }
+
+    const cliente = await findCustomerByEmail(email);
+
+    return res.json({
+      sucesso: true,
+      encontrado: Boolean(cliente),
+      cliente,
+    });
+  } catch (error) {
+    return sendCustomerLookupError(res, error);
+  }
+});
+
+app.post("/api/cupons/validar", async (req, res) => {
+  try {
+    const body = await obterBodyJson(req);
+    const codigo = normalizeCouponCode(body.codigo || body.cupomCodigo);
+    const subtotal = round2(body.subtotal);
+    const identity = {
+      cpf: normalizeCustomerCpf(
+          body.cpf ||
+          body.documento ||
+          body.documentoLimpo ||
+          body.cpfNormalizado,
+      ),
+      email: normalizeCustomerEmail(body.email),
+    };
+
+    assertCouponCodeValid(codigo);
+
+    if (!Number.isFinite(subtotal) || subtotal < 0) {
+      throw createHttpError(
+          422,
+          "cupom_subtotal_invalido",
+          "Subtotal invalido para validar cupom.",
+      );
+    }
+
+    const snapshot = await getCouponRef(codigo).get();
+    const coupon = assertCouponSnapshotValid(snapshot, codigo, new Date());
+    await assertCouponNotUsedByIdentity(codigo, identity);
+    const valorDesconto = calculateCouponOrderDiscount(subtotal, coupon);
+
+    return res.json({
+      sucesso: true,
+      cupom: {
+        codigo,
+        descricao: String(coupon.descricao || "").trim(),
+        tipo: "porcentagem",
+        percentual: coupon.percentual,
+        valorDesconto,
+      },
+    });
+  } catch (error) {
+    return sendCouponValidationError(res, error);
+  }
+});
+
 app.post("/api/pedidos", async (req, res) => {
   try {
     const body = await obterBodyJson(req);
@@ -5937,6 +8572,22 @@ app.post("/api/pedidos", async (req, res) => {
     });
   } catch (error) {
     return sendOrderCreateError(res, error);
+  }
+});
+
+app.post("/api/carrinho/validar-estoque", async (req, res) => {
+  try {
+    const body = await obterBodyJson(req);
+    const itens = normalizeOrderItemsForCreate(body.itens);
+    const result = await validateCartStockItems(itens);
+
+    return res.json({
+      sucesso: true,
+      valido: true,
+      carrinhoAtualizado: result.carrinhoAtualizado,
+    });
+  } catch (error) {
+    return sendCartStockValidationError(res, error);
   }
 });
 
@@ -5987,6 +8638,7 @@ app.post(
           force: true,
           requireNotificationToken: false,
           triggeredBy: req.adminUser.uid,
+          emailMode: "smtp",
         });
 
         return res.json({
@@ -6341,6 +8993,53 @@ app.post("/api/pagamentos/mercado-pago/criar-pagamento", async (req, res) => {
 
     const totals = await recalculateOrderTotals(order);
     assertPaymentTotalMatches(body.valor ?? body.total, totals.total);
+    await orderRef.set({
+      itens: totals.itens,
+      subtotal: totals.subtotal,
+      subtotalProdutos: totals.subtotalProdutos,
+      valorFrete: totals.valorFrete,
+      cupom: totals.cupom,
+      cupomCodigo: totals.cupomCodigo,
+      valorDescontoCupom: totals.valorDescontoCupom,
+      descontoCupomPercentual: totals.descontoCupomPercentual,
+      desconto: totals.desconto,
+      descontoPercentual: totals.descontoPercentual,
+      descontoPix: totals.descontoPix,
+      descontoTotal: totals.descontoTotal,
+      totalSemDesconto: totals.totalSemDesconto,
+      totalAntesDescontos: totals.totalAntesDescontos,
+      totalAntesDescontoPix: totals.totalAntesDescontoPix,
+      totalFinal: totals.totalFinal,
+      total: totals.total,
+      "pagamento.valor": totals.total,
+      "pagamento.desconto": totals.desconto,
+      "pagamento.descontoPercentual": totals.descontoPercentual,
+      "pagamento.descontoPix": totals.descontoPix,
+      "pagamento.valorDescontoCupom": totals.valorDescontoCupom,
+      "pagamento.descontoCupomPercentual": totals.descontoCupomPercentual,
+      "pagamento.descontoTotal": totals.descontoTotal,
+      "pagamento.valorSemDesconto": totals.totalSemDesconto,
+      "pagamento.cupomCodigo": totals.cupomCodigo,
+      "pagamento.cupom": totals.cupom,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, {merge: true});
+    order.itens = totals.itens;
+    order.subtotal = totals.subtotal;
+    order.subtotalProdutos = totals.subtotalProdutos;
+    order.valorFrete = totals.valorFrete;
+    order.cupom = totals.cupom;
+    order.cupomCodigo = totals.cupomCodigo;
+    order.valorDescontoCupom = totals.valorDescontoCupom;
+    order.descontoCupomPercentual = totals.descontoCupomPercentual;
+    order.desconto = totals.desconto;
+    order.descontoPercentual = totals.descontoPercentual;
+    order.descontoPix = totals.descontoPix;
+    order.descontoTotal = totals.descontoTotal;
+    order.totalSemDesconto = totals.totalSemDesconto;
+    order.totalAntesDescontos = totals.totalAntesDescontos;
+    order.totalAntesDescontoPix = totals.totalAntesDescontoPix;
+    order.totalFinal = totals.totalFinal;
+    order.total = totals.total;
 
     const installments = ["credit_card", "debit_card"].includes(method) ?
       await resolveMercadoPagoInstallments({
@@ -6640,3 +9339,26 @@ exports.api = functions
       maxInstances: 10,
     })
     .https.onRequest(app);
+
+exports.orderEmailAutomation = functions
+    .region("us-central1")
+    .runWith({
+      timeoutSeconds: 60,
+      memory: "512MB",
+      maxInstances: 10,
+    })
+    .firestore
+    .document("pedidos/{pedidoId}")
+    .onWrite(handleOrderEmailAutomation);
+
+exports.cancelPendingPaymentOrders = functions
+    .region("us-central1")
+    .runWith({
+      timeoutSeconds: 120,
+      memory: "512MB",
+      maxInstances: 1,
+    })
+    .pubsub
+    .schedule("every 30 minutes")
+    .timeZone("America/Sao_Paulo")
+    .onRun(cancelExpiredPendingPaymentOrders);

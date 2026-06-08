@@ -4,7 +4,6 @@ import { useCollectionData, useDocumentData } from '../hooks/useFirestoreData.js
 import {
   ContentIcon,
   DashboardIcon,
-  LeadsIcon,
   ProductsIcon,
   SettingsIcon,
 } from '../components/AdminIcons.jsx'
@@ -26,7 +25,6 @@ function StatCard({ icon: Icon, label, value, detail }) {
 
 export default function DashboardPage() {
   const { data: products, loading: loadingProducts } = useCollectionData('produtos')
-  const { data: leads, loading: loadingLeads } = useCollectionData('leads')
   const { data: content } = useDocumentData('conteudo', 'landing', defaultLandingContent)
   const { data: settings } = useDocumentData('configuracoes', 'geral', defaultSettings)
 
@@ -35,21 +33,12 @@ export default function DashboardPage() {
 
   const allDates = [
     ...products.map((product) => product.updatedAt || product.createdAt),
-    ...leads.map((lead) => lead.updatedAt || lead.data),
     content.updatedAt,
     settings.updatedAt,
   ]
     .map(getDateValue)
     .filter(Boolean)
     .sort((first, second) => second.getTime() - first.getTime())
-
-  const latestLeads = [...leads]
-    .sort((first, second) => {
-      const secondDate = getDateValue(second.data)?.getTime() || 0
-      const firstDate = getDateValue(first.data)?.getTime() || 0
-      return secondDate - firstDate
-    })
-    .slice(0, 4)
 
   const latestProducts = [...products]
     .sort((first, second) => {
@@ -65,7 +54,7 @@ export default function DashboardPage() {
         <div>
           <span className="admin-kicker">Dashboard</span>
           <h1>Visão rápida do que mais importa.</h1>
-          <p>Resumo operacional do catálogo, conteúdo e leads em uma única tela.</p>
+          <p>Resumo operacional do catalogo, configuracoes e ultimas atualizacoes.</p>
         </div>
       </div>
 
@@ -75,12 +64,6 @@ export default function DashboardPage() {
           label="Total de produtos"
           value={loadingProducts ? '...' : products.length}
           detail="Catálogo completo no Firestore"
-        />
-        <StatCard
-          icon={LeadsIcon}
-          label="Leads recebidos"
-          value={loadingLeads ? '...' : leads.length}
-          detail="Entradas acompanhadas pela equipe"
         />
         <StatCard
           icon={DashboardIcon}
@@ -145,34 +128,6 @@ export default function DashboardPage() {
       </div>
 
       <div className="admin-duo-grid">
-        <article className="admin-surface">
-          <div className="admin-surface-head">
-            <div>
-              <span className="admin-kicker">Leads recentes</span>
-              <h2>Últimos contatos</h2>
-            </div>
-            <LeadsIcon className="admin-inline-icon" />
-          </div>
-
-          {latestLeads.length ? (
-            <div className="admin-list-cards">
-              {latestLeads.map((lead) => (
-                <div key={lead.id} className="admin-list-card">
-                  <div>
-                    <strong>{lead.nome || 'Lead sem nome'}</strong>
-                    <span>{lead.contato || 'Sem contato informado'}</span>
-                  </div>
-                  <small>{formatDateTime(lead.data)}</small>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className="admin-empty-state">
-              <p>Nenhum lead cadastrado até agora.</p>
-            </div>
-          )}
-        </article>
-
         <article className="admin-surface">
           <div className="admin-surface-head">
             <div>

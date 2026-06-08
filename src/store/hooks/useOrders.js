@@ -4,7 +4,17 @@ const ORDER_CREATE_ERROR_MESSAGES = {
   pedido_cliente_invalido: 'Informe os dados do cliente para criar o pedido.',
   pedido_item_invalido: 'Um produto do pedido possui preco invalido.',
   pedido_sem_itens: 'Inclua ao menos um produto no pedido.',
+  pedido_estoque_indisponivel: 'Alguns itens do carrinho nao estao mais disponiveis.',
   pedido_total_invalido: 'O total do pedido esta invalido.',
+  pedido_cupom_indisponivel: 'O cupom aplicado nao esta mais disponivel. Remova ou escolha outro cupom para continuar.',
+  cupom_codigo_invalido: 'O cupom aplicado nao esta mais disponivel. Remova ou escolha outro cupom para continuar.',
+  cupom_nao_encontrado: 'O cupom aplicado nao esta mais disponivel. Remova ou escolha outro cupom para continuar.',
+  cupom_indisponivel: 'O cupom aplicado nao esta mais disponivel. Remova ou escolha outro cupom para continuar.',
+  cupom_expirado: 'O cupom aplicado nao esta mais disponivel. Remova ou escolha outro cupom para continuar.',
+  cupom_nao_iniciado: 'O cupom aplicado nao esta mais disponivel. Remova ou escolha outro cupom para continuar.',
+  cupom_percentual_invalido: 'O cupom aplicado nao esta mais disponivel. Remova ou escolha outro cupom para continuar.',
+  cupom_cliente_obrigatorio: 'Informe CPF ou e-mail para aplicar o cupom.',
+  cupom_ja_utilizado: 'Este cupom ja foi utilizado por este CPF ou e-mail.',
 }
 
 async function parseOrderCreateResponse(response) {
@@ -23,7 +33,11 @@ async function parseOrderCreateResponse(response) {
     const message = data?.code && ORDER_CREATE_ERROR_MESSAGES[data.code]
       ? ORDER_CREATE_ERROR_MESSAGES[data.code]
       : data?.erro || 'Erro ao criar pedido.'
-    throw new Error(message)
+    const error = new Error(message)
+    error.code = data?.code || null
+    error.details = data?.details || null
+    error.statusCode = response.status
+    throw error
   }
 
   if (!data?.pedidoId) {
@@ -61,6 +75,10 @@ export function useOrders() {
     frete,
     itens,
     subtotal,
+    desconto = 0,
+    descontoPercentual = 0,
+    totalSemDesconto = null,
+    cupomCodigo = '',
     total,
     status = 'pendente',
     pagamento = null,
@@ -75,6 +93,10 @@ export function useOrders() {
         itens,
         frete,
         subtotal,
+        desconto,
+        descontoPercentual,
+        totalSemDesconto,
+        cupomCodigo,
         total,
         status,
         pagamento,
@@ -88,7 +110,7 @@ export function useOrders() {
       return result.pedidoId
     } catch (err) {
       setError(err.message || 'Erro ao criar pedido.')
-      return null
+      throw err
     } finally {
       setSubmitting(false)
     }

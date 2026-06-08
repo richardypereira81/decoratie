@@ -1,5 +1,6 @@
 import { memo, useEffect, useId, useState } from 'react'
 import { formatCurrency } from '../../shared/formatters.js'
+import { getInstallmentLabel } from '../../shared/pricing.js'
 import { getPrimaryProductCategory } from '../../shared/productCategories.js'
 import { BellIcon, CartIcon, CloseIcon, ShareIcon } from './StoreIcons.jsx'
 import QuantitySelector from './QuantitySelector.jsx'
@@ -408,6 +409,7 @@ function ProductModal({
                   <div className="store-product-modal-pricing">
                     <div className="store-product-modal-total">
                       <strong>{totalPriceLabel}</strong>
+                      <small>{getInstallmentLabel(totalPrice)}</small>
                     </div>
 
                     <QuantitySelector

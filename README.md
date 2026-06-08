@@ -1,5 +1,11 @@
 # React + Vite
 
+## Configuracao local
+
+Copie `.env.example` para `.env.local` antes de rodar o projeto se quiser usar variaveis locais.
+
+Para ativar a busca integrada de imagens no cadastro de produtos, preencha o campo Google CSE ID em Admin > Configuracoes ou defina `VITE_GOOGLE_CSE_ID` com o ID `cx` de um Google Programmable Search Engine com busca por imagens habilitada. Sem esse valor, o sistema abre a busca do Google Imagens em uma nova aba como fallback.
+
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
 Currently, two official plugins are available:

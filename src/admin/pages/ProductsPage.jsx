@@ -12,6 +12,7 @@ import {
 import { db } from "../../lib/firebaseClient.js";
 import { removeStoredFile, uploadImage } from "../../lib/storageUploads.js";
 import {
+  formatDisplayText,
   formatCurrency,
   formatRoundedCurrency,
   formatUppercaseText,
@@ -23,10 +24,15 @@ import {
   getPrimaryProductCategory,
   normalizeProductCategories,
   productMatchesCategory,
+  UNCATEGORIZED_CATEGORY_FILTER,
 } from "../../shared/productCategories.js";
+import {
+  hasProductCategory,
+  hasProductImage,
+  isProductStoreVisible,
+} from "../../shared/productVisibility.js";
 import ActionsDropdown from "../components/ActionsDropdown.jsx";
 import {
-  CheckIcon,
   DownloadIcon,
   EditIcon,
   PlusIcon,
@@ -35,6 +41,7 @@ import {
 import DataTable from "../components/DataTable.jsx";
 import { useAdminUI } from "../components/AdminLayout.jsx";
 import FiltrosProdutos from "../components/FiltrosProdutos.jsx";
+import Modal from "../components/Modal.jsx";
 import ProductModal from "../components/ProductModal.jsx";
 import SearchInput from "../components/SearchInput.jsx";
 import Toolbar from "../components/Toolbar.jsx";
@@ -44,11 +51,17 @@ import {
   formatOrigemProdutoDetailed,
   normalizeOrigemProdutoValue,
 } from "../services/origemProdutoOptions.js";
+import { calcularPrecoVenda, round2 } from "../services/custoService.js";
 import { resolveProductDescription } from "../services/productDescriptionService.js";
 import { importRemoteProductImage } from "../services/productImageService.js";
 import { downloadCsv } from "../utils/exportCsv.js";
 
 function ProductIdentityCell({ product }) {
+  const storeVisible = isProductStoreVisible(product);
+  const missingCategory = !hasProductCategory(product);
+  const missingImage = !hasProductImage(product);
+  const lowMargin = hasLowProductMargin(product);
+
   return (
     <div className="admin-table-identity">
       <div className="admin-table-thumb">
@@ -67,18 +80,24 @@ function ProductIdentityCell({ product }) {
       <div className="admin-table-copy">
         <strong>{formatUppercaseText(product.nome, "PRODUTO SEM NOME")}</strong>
         <span className="admin-table-subtitle">
-          {formatUppercaseText(
-            resolveProductDescription(product),
-            "DESCRICAO NAO INFORMADA.",
-          )}
+          {formatDisplayText(resolveProductDescription(product)) || "Descricao nao informada."}
         </span>
 
         <div className="admin-table-badges">
           <span
-            className={`admin-badge ${product.ativo !== false ? "is-live" : "is-muted"}`}
+            className={`admin-badge ${storeVisible ? "is-live" : "is-muted"}`}
           >
-            {product.ativo !== false ? "Ativo" : "Inativo"}
+            {product.ativo === false ? "Inativo" : storeVisible ? "Ativo" : "Invisivel na loja"}
           </span>
+          {missingCategory ? (
+            <span className="admin-badge is-muted">Sem categoria</span>
+          ) : null}
+          {missingImage ? (
+            <span className="admin-badge is-muted">Sem foto</span>
+          ) : null}
+          {lowMargin ? (
+            <span className="admin-badge is-danger">Margem abaixo de 100%</span>
+          ) : null}
           {product.destaque ? (
             <span className="admin-badge is-accent">Destaque</span>
           ) : null}
@@ -163,12 +182,54 @@ function buildFileStamp() {
   return new Date().toISOString().slice(0, 10);
 }
 
+function getProductCostValue(product) {
+  if (
+    product?.custoReal === "" ||
+    product?.custoReal === null ||
+    product?.custoReal === undefined
+  ) {
+    return null;
+  }
+
+  const cost = Number(product.custoReal);
+  return Number.isFinite(cost) && cost >= 0 ? cost : null;
+}
+
+function getProductSalePriceValue(product) {
+  const rawPrice =
+    product?.precoVenda === "" ||
+    product?.precoVenda === null ||
+    product?.precoVenda === undefined
+      ? product?.preco
+      : product.precoVenda;
+
+  if (rawPrice === "" || rawPrice === null || rawPrice === undefined) {
+    return null;
+  }
+
+  const price = Number(rawPrice);
+  return Number.isFinite(price) ? price : null;
+}
+
+function hasLowProductMargin(product) {
+  const cost = getProductCostValue(product);
+  const price = getProductSalePriceValue(product);
+
+  if (cost === null || cost <= 0 || price === null) {
+    return false;
+  }
+
+  return price < calcularPrecoVenda(cost, 100);
+}
+
 const initialFilters = {
   category: "all",
   dataEntradaAte: "",
   dataEntradaDe: "",
   featured: "all",
+  margin: "all",
   numeroNota: "",
+  photo: "all",
   sector: "all",
   status: "all",
 };
@@ -195,6 +256,9 @@ export default function ProductsPage() {
   const [search, setSearch] = useState("");
   const [filters, setFilters] = useState(initialFilters);
   const [modalOpen, setModalOpen] = useState(false);
+  const [bulkPriceModalOpen, setBulkPriceModalOpen] = useState(false);
+  const [bulkPricePercent, setBulkPricePercent] = useState("");
+  const [bulkPriceSaving, setBulkPriceSaving] = useState(false);
   const [editingProduct, setEditingProduct] = useState(null);
   const [saving, setSaving] = useState(false);
   const [bulkDeleting, setBulkDeleting] = useState(false);
@@ -248,6 +312,8 @@ export default function ProductsPage() {
       .filter((product) => {
         const productCategories = getProductCategories(product);
         const categoryText = productCategories.join(" ");
+        const hasImage = hasProductImage(product);
+        const lowMargin = hasLowProductMargin(product);
         const sector = String(product.setor || "").trim();
         const isActive = product.ativo !== false;
         const ultimaNotaCompra = String(product.ultimaNotaCompra || "").trim();
@@ -295,7 +361,30 @@ export default function ProductsPage() {
           return false;
         }
 
-        if (filters.category !== "all" && !productMatchesCategory(product, filters.category)) {
+        if (
+          filters.category === UNCATEGORIZED_CATEGORY_FILTER &&
+          productCategories.length
+        ) {
+          return false;
+        }
+
+        if (
+          filters.category !== "all" &&
+          filters.category !== UNCATEGORIZED_CATEGORY_FILTER &&
+          !productMatchesCategory(product, filters.category)
+        ) {
+          return false;
+        }
+
+        if (filters.photo === "with_photo" && !hasImage) {
+          return false;
+        }
+
+        if (filters.photo === "without_photo" && hasImage) {
+          return false;
+        }
+
+        if (filters.margin === "below_100" && !lowMargin) {
           return false;
         }
 
@@ -328,6 +417,29 @@ export default function ProductsPage() {
   const activeFilterCount = Object.entries(filters).filter(
     ([key, value]) => value !== initialFilters[key] && Boolean(value),
   ).length;
+  const bulkPriceProducts = useMemo(
+    () => filteredProducts.filter((product) => product.id && getProductCostValue(product) !== null),
+    [filteredProducts],
+  );
+  const bulkPricePreview = useMemo(() => {
+    const margin = Number(bulkPricePercent);
+
+    if (!Number.isFinite(margin) || margin < 0) {
+      return [];
+    }
+
+    return bulkPriceProducts.map((product) => {
+      const cost = getProductCostValue(product);
+
+      return {
+        cost,
+        id: product.id,
+        name: product.nome || "Produto",
+        currentPrice: getProductSalePriceValue(product),
+        nextPrice: calcularPrecoVenda(cost, margin),
+      };
+    });
+  }, [bulkPricePercent, bulkPriceProducts]);
 
   const columns = [
     {
@@ -345,16 +457,6 @@ export default function ProductsPage() {
             {formatUppercaseText(formatProductCategories(product), "SEM CATEGORIA")}
           </strong>
           <span>{getProductCategories(product).length > 1 ? "MULTIPLAS CATEGORIAS" : "CLASSIFICACAO PRINCIPAL"}</span>
-        </div>
-      ),
-    },
-    {
-      key: "setor",
-      header: "Setor",
-      cell: (product) => (
-        <div className="admin-table-stack">
-          <strong>{formatUppercaseText(product.setor, "SEM SETOR")}</strong>
-          <span>SEGMENTO INTERNO</span>
         </div>
       ),
     },
@@ -396,18 +498,6 @@ export default function ProductsPage() {
           </button>
           <button
             type="button"
-            className="admin-icon-btn"
-            onClick={() => toggleProductStatus(product)}
-            aria-label={
-              product.ativo !== false
-                ? `Desativar ${product.nome}`
-                : `Ativar ${product.nome}`
-            }
-          >
-            <CheckIcon className="admin-inline-icon" />
-          </button>
-          <button
-            type="button"
             className="admin-icon-btn is-danger"
             onClick={() => deleteProduct(product)}
             aria-label={`Excluir ${product.nome}`}
@@ -427,6 +517,20 @@ export default function ProductsPage() {
   function openEditProduct(product) {
     setEditingProduct(product);
     setModalOpen(true);
+  }
+
+  function openBulkPriceAdjustment() {
+    setBulkPricePercent("");
+    setBulkPriceModalOpen(true);
+  }
+
+  function closeBulkPriceAdjustment() {
+    if (bulkPriceSaving) {
+      return;
+    }
+
+    setBulkPriceModalOpen(false);
+    setBulkPricePercent("");
   }
 
   async function adjustProductStock(product, delta) {
@@ -478,6 +582,86 @@ export default function ProductsPage() {
         delete next[product.id];
         return next;
       });
+    }
+  }
+
+  async function handleBulkPriceAdjustment(event) {
+    event.preventDefault();
+
+    const numericMargin = Number(bulkPricePercent);
+
+    if (!Number.isFinite(numericMargin) || numericMargin < 0) {
+      notify({
+        type: "error",
+        title: "Percentual invalido",
+        description: "Informe uma margem maior ou igual a 0.",
+      });
+      return;
+    }
+
+    const margin = round2(numericMargin);
+
+    if (!bulkPriceProducts.length) {
+      notify({
+        type: "error",
+        title: "Nenhum produto ajustavel",
+        description: "Os produtos exibidos precisam ter custo real informado.",
+      });
+      return;
+    }
+
+    const skippedCount = filteredProducts.length - bulkPriceProducts.length;
+    const confirmed = window.confirm(
+      `Aplicar margem de ${margin}% em ${bulkPriceProducts.length} produto(s) exibido(s)?` +
+        (skippedCount > 0 ? ` ${skippedCount} produto(s) sem custo real serao ignorados.` : ""),
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    setBulkPriceSaving(true);
+    let updatedCount = 0;
+
+    try {
+      for (let index = 0; index < bulkPriceProducts.length; index += 400) {
+        const chunk = bulkPriceProducts.slice(index, index + 400);
+        const batch = writeBatch(db);
+
+        chunk.forEach((product) => {
+          const cost = getProductCostValue(product);
+          const price = calcularPrecoVenda(cost, margin);
+
+          batch.update(doc(db, "produtos", product.id), {
+            margemPadrao: margin,
+            precoVenda: price,
+            preco: price,
+            updatedAt: serverTimestamp(),
+          });
+        });
+
+        await batch.commit();
+        updatedCount += chunk.length;
+      }
+
+      notify({
+        type: "success",
+        title: "Ajuste em massa aplicado",
+        description: `${updatedCount} produto(s) atualizado(s) com margem de ${margin}%.`,
+      });
+
+      setBulkPriceModalOpen(false);
+      setBulkPricePercent("");
+    } catch (error) {
+      notify({
+        type: "error",
+        title: "Nao foi possivel aplicar o ajuste",
+        description: updatedCount > 0
+          ? `${updatedCount} produto(s) ja tinham sido atualizados antes da falha. ${error.message || "Revise e tente novamente."}`
+          : error.message || "Revise e tente novamente.",
+      });
+    } finally {
+      setBulkPriceSaving(false);
     }
   }
 
@@ -601,7 +785,7 @@ export default function ProductsPage() {
 
       const payload = {
         nome: normalizeUppercaseText(draft.nome),
-        descricao: normalizeUppercaseText(resolveProductDescription(draft)),
+        descricao: formatDisplayText(resolveProductDescription(draft)),
         preco: Number.isFinite(draft.precoVenda)
           ? draft.precoVenda
           : Number.isFinite(draft.preco)
@@ -639,6 +823,7 @@ export default function ProductsPage() {
         imagemPath: imagePath,
         updatedAt: serverTimestamp(),
       };
+      const willBeVisibleInStore = isProductStoreVisible(payload);
 
       if (hasExistingProduct) {
         await updateDoc(productRef, payload);
@@ -652,7 +837,9 @@ export default function ProductsPage() {
       notify({
         type: "success",
         title: hasExistingProduct ? "Produto atualizado" : "Produto criado",
-        description: `${draft.nome} esta pronto para uso no catalogo.`,
+        description: willBeVisibleInStore
+          ? `${draft.nome} esta pronto para uso no catalogo.`
+          : `${draft.nome} foi salvo, mas fica invisivel na loja ate ter categoria e foto.`,
       });
 
       setModalOpen(false);
@@ -665,28 +852,6 @@ export default function ProductsPage() {
       });
     } finally {
       setSaving(false);
-    }
-  }
-
-  async function toggleProductStatus(product) {
-    try {
-      await updateDoc(doc(db, "produtos", product.id), {
-        ativo: !(product.ativo !== false),
-        updatedAt: serverTimestamp(),
-      });
-
-      notify({
-        type: "success",
-        title:
-          product.ativo !== false ? "Produto desativado" : "Produto ativado",
-        description: product.nome,
-      });
-    } catch (error) {
-      notify({
-        type: "error",
-        title: "Nao foi possivel atualizar o status",
-        description: error.message || "Tente novamente.",
-      });
     }
   }
 
@@ -793,6 +958,13 @@ export default function ProductsPage() {
       onSelect: exportProducts,
     },
     {
+      id: "bulk-price-adjustment",
+      label: "Ajuste em massa",
+      icon: EditIcon,
+      disabled: bulkDeleting || bulkPriceSaving || !filteredProducts.length,
+      onSelect: openBulkPriceAdjustment,
+    },
+    {
       id: "delete-all",
       label: "Excluir todos produtos",
       icon: TrashIcon,
@@ -829,6 +1001,7 @@ export default function ProductsPage() {
             sectors={sectors}
           />
         }
+        recordCount={filteredProducts.length}
         actions={
           <ActionsDropdown
             items={actionItems}
@@ -845,6 +1018,83 @@ export default function ProductsPage() {
         loadingState="Carregando catalogo..."
         emptyState="Nenhum produto encontrado com esse filtro."
       />
+
+      <Modal
+        open={bulkPriceModalOpen}
+        onClose={closeBulkPriceAdjustment}
+        title="Ajuste em massa"
+        width="small"
+      >
+        <form className="admin-form admin-modal-body" onSubmit={handleBulkPriceAdjustment}>
+          <div className="admin-inline-notice admin-bulk-price-summary">
+            <strong>{filteredProducts.length} produto(s) exibido(s)</strong>
+            <span>{bulkPriceProducts.length} com custo real para recalcular</span>
+          </div>
+
+          <label className="admin-field">
+            <span>Margem sobre custo real (%)</span>
+            <input
+              className="admin-input"
+              type="number"
+              min="0"
+              step="0.01"
+              value={bulkPricePercent}
+              onChange={(event) => setBulkPricePercent(event.target.value)}
+              placeholder="Ex.: 25"
+              required
+            />
+          </label>
+
+          {bulkPricePreview.length ? (
+            <div className="admin-bulk-price-preview">
+              <div className="admin-bulk-price-preview-head">
+                <strong>Previa</strong>
+                <span>{bulkPricePreview.length} item(s)</span>
+              </div>
+
+              <div className="admin-bulk-price-preview-list">
+                {bulkPricePreview.map((item) => (
+                  <div className="admin-bulk-price-preview-item" key={item.id}>
+                    <strong>{formatUppercaseText(item.name)}</strong>
+                    <div className="admin-bulk-price-preview-values">
+                      <span>
+                        <small>Custo</small>
+                        {formatCurrency(item.cost)}
+                      </span>
+                      <span>
+                        <small>Venda atual</small>
+                        {formatCurrency(item.currentPrice)}
+                      </span>
+                      <span>
+                        <small>Nova venda</small>
+                        {formatCurrency(item.nextPrice)}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
+          <div className="admin-modal-actions">
+            <button
+              type="button"
+              className="admin-btn-secondary"
+              onClick={closeBulkPriceAdjustment}
+              disabled={bulkPriceSaving}
+            >
+              Cancelar
+            </button>
+            <button
+              type="submit"
+              className="admin-btn"
+              disabled={bulkPriceSaving || !bulkPriceProducts.length}
+            >
+              {bulkPriceSaving ? "Aplicando..." : "Aplicar ajuste"}
+            </button>
+          </div>
+        </form>
+      </Modal>
 
       <ProductModal
         categories={categories}

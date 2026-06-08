@@ -1,4 +1,4 @@
-const GOOGLE_CSE_ID = import.meta.env.VITE_GOOGLE_CSE_ID || ''
+const BUILD_TIME_GOOGLE_CSE_ID = import.meta.env.VITE_GOOGLE_CSE_ID || ''
 const API_BASE = '/api/produtos'
 const GCSE_SCRIPT_ID = 'decoratie-google-cse-script'
 const GOOGLE_IMAGE_LISTENERS_KEY = '__decoratieGoogleImageListeners'
@@ -20,36 +20,38 @@ function ensureGoogleCallbacks() {
   if (!window[GOOGLE_IMAGE_READY_KEY]) {
     window[GOOGLE_IMAGE_READY_KEY] = (gname, query, promos, results, div) => {
       const gnameListeners = listeners.get(gname)
+      let handled = false
 
       if (gnameListeners) {
         gnameListeners.forEach((listener) => {
-          listener({ div, promos, query, results })
+          handled = listener({ div, promos, query, results }) === true || handled
         })
       }
 
-      if (div) {
+      if (handled && div) {
         div.innerHTML = ''
       }
 
-      return true
+      return handled
     }
   }
 
   if (!window[GOOGLE_WEB_READY_KEY]) {
     window[GOOGLE_WEB_READY_KEY] = (gname, query, promos, results, div) => {
       const gnameListeners = listeners.get(`web:${gname}`)
+      let handled = false
 
       if (gnameListeners) {
         gnameListeners.forEach((listener) => {
-          listener({ div, promos, query, results })
+          handled = listener({ div, promos, query, results }) === true || handled
         })
       }
 
-      if (div) {
+      if (handled && div) {
         div.innerHTML = ''
       }
 
-      return true
+      return handled
     }
   }
 }
@@ -88,19 +90,35 @@ function configureGcseWindow(resolve) {
 }
 
 export function hasGoogleImageSearchConfig() {
-  return Boolean(GOOGLE_CSE_ID)
+  return Boolean(resolveGoogleCseId())
 }
 
-export function getGoogleImageSearchConfig() {
+function resolveGoogleCseId(runtimeCseId = '') {
+  return String(runtimeCseId || BUILD_TIME_GOOGLE_CSE_ID || '').trim()
+}
+
+export function getGoogleImageSearchConfig(runtimeCseId = '') {
+  const cseId = resolveGoogleCseId(runtimeCseId)
+
   return {
-    cseId: GOOGLE_CSE_ID,
-    enabled: hasGoogleImageSearchConfig(),
+    cseId,
+    enabled: Boolean(cseId),
   }
 }
 
-export async function ensureGoogleImageSearchLoaded() {
-  if (!GOOGLE_CSE_ID) {
-    throw new Error('Configure VITE_GOOGLE_CSE_ID para ativar a busca no Google Imagens.')
+export function buildGoogleImagesSearchUrl(query) {
+  const params = new window.URLSearchParams()
+  params.set('q', query)
+  params.set('tbm', 'isch')
+
+  return `https://www.google.com/search?${params.toString()}`
+}
+
+export async function ensureGoogleImageSearchLoaded(runtimeCseId = '') {
+  const googleCseId = resolveGoogleCseId(runtimeCseId)
+
+  if (!googleCseId) {
+    throw new Error('Configure o Google CSE ID para ativar a busca no Google Imagens.')
   }
 
   if (window.google?.search?.cse?.element) {
@@ -128,7 +146,7 @@ export async function ensureGoogleImageSearchLoaded() {
     const script = document.createElement('script')
     script.id = GCSE_SCRIPT_ID
     script.async = true
-    script.src = `https://cse.google.com/cse.js?cx=${encodeURIComponent(GOOGLE_CSE_ID)}`
+    script.src = `https://cse.google.com/cse.js?cx=${encodeURIComponent(googleCseId)}`
     script.onerror = () => reject(new Error('Nao foi possivel carregar o Google Search.'))
     document.head.appendChild(script)
   })

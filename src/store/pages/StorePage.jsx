@@ -1,4 +1,4 @@
-import { startTransition, useCallback, useEffect, useMemo, useState } from 'react'
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { useCart } from '../hooks/useCart.js'
 import { useProducts } from '../hooks/useProducts.js'
@@ -20,9 +20,50 @@ function buildProductShareUrl(productId) {
   return url.toString()
 }
 
+const PRODUCTS_PER_PAGE = 8
+
+function buildPaginationItems(currentPage, totalPages) {
+  if (totalPages <= 7) {
+    return Array.from({ length: totalPages }, (_, index) => index + 1)
+  }
+
+  const pages = new Set([1, totalPages, currentPage])
+
+  if (currentPage > 2) {
+    pages.add(currentPage - 1)
+  }
+
+  if (currentPage < totalPages - 1) {
+    pages.add(currentPage + 1)
+  }
+
+  const sortedPages = [...pages].sort((first, second) => first - second)
+  const items = []
+
+  sortedPages.forEach((page, index) => {
+    const previousPage = sortedPages[index - 1]
+
+    if (previousPage && page - previousPage > 1) {
+      items.push(`gap-${previousPage}-${page}`)
+    }
+
+    items.push(page)
+  })
+
+  return items
+}
+
 export default function StorePage() {
   const [urlSearchParams, setUrlSearchParams] = useSearchParams()
-  const { items, addItem, removeItem, updateQuantity, totalItems, totalPrice } = useCart()
+  const {
+    items,
+    addItem,
+    removeItem,
+    updateQuantity,
+    replaceItems,
+    totalItems,
+    totalPrice,
+  } = useCart()
   const { data: storeSettings } = useStoreSettings()
   const {
     products,
@@ -44,6 +85,8 @@ export default function StorePage() {
   const [activeProduct, setActiveProduct] = useState(null)
   const [notifyProduct, setNotifyProduct] = useState(null)
   const [selectedQuantity, setSelectedQuantity] = useState(1)
+  const [currentPage, setCurrentPage] = useState(1)
+  const productsSectionRef = useRef(null)
   const sharedProductId = urlSearchParams.get('produto')
 
   useEffect(() => {
@@ -97,6 +140,18 @@ export default function StorePage() {
   }, [activeProduct?.id, loading, products, sharedProductId])
 
   const activeFilterCount = Number(category !== 'all') + Number(sort !== 'default')
+  const totalProducts = filteredProducts.length
+  const totalPages = Math.max(1, Math.ceil(totalProducts / PRODUCTS_PER_PAGE))
+  const safeCurrentPage = Math.min(Math.max(1, currentPage), totalPages)
+  const pageStartIndex = totalProducts ? (safeCurrentPage - 1) * PRODUCTS_PER_PAGE : 0
+  const paginatedProducts = useMemo(
+    () => filteredProducts.slice(pageStartIndex, pageStartIndex + PRODUCTS_PER_PAGE),
+    [filteredProducts, pageStartIndex],
+  )
+  const paginationItems = useMemo(
+    () => buildPaginationItems(safeCurrentPage, totalPages),
+    [safeCurrentPage, totalPages],
+  )
   const whatsappUrl = useMemo(
     () => getWhatsAppUrlFromSettings(storeSettings),
     [storeSettings]
@@ -121,6 +176,16 @@ export default function StorePage() {
 
     return 'Mais vendidos'
   }, [category, search])
+
+  useEffect(() => {
+    setCurrentPage(1)
+  }, [category, search, sort])
+
+  useEffect(() => {
+    if (currentPage > totalPages) {
+      setCurrentPage(totalPages)
+    }
+  }, [currentPage, totalPages])
 
   const sectionDescription = useMemo(() => {
     if (search.trim()) {
@@ -152,6 +217,15 @@ export default function StorePage() {
       setSort('default')
     })
   }, [setCategory, setSort])
+
+  const handlePageChange = useCallback((nextPage) => {
+    const safePage = Math.min(Math.max(1, nextPage), totalPages)
+
+    setCurrentPage(safePage)
+    window.requestAnimationFrame(() => {
+      productsSectionRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+    })
+  }, [totalPages])
 
   const handleOpenCart = useCallback(() => {
     setNavOpen(false)
@@ -254,23 +328,60 @@ export default function StorePage() {
           />
 
           <div className="store-catalog-main">
-            <section className="store-section" id="produtos">
+            <section className="store-section" id="produtos" ref={productsSectionRef}>
               <div className="store-section-header">
                 <div>
                   <h2 className="store-section-title">{catalogTitle}</h2>
                   <p className="store-section-description">{sectionDescription}</p>
                 </div>
-                <span className="store-section-count">
-                  {filteredProducts.length} {filteredProducts.length === 1 ? 'produto' : 'produtos'}
-                </span>
               </div>
 
               <ProductGrid
-                products={filteredProducts}
+                products={paginatedProducts}
                 onProductClick={handleOpenProduct}
                 onAddToCart={handleAddToCart}
                 emptyMessage="Nenhum produto encontrado."
               />
+
+              {totalPages > 1 ? (
+                <nav className="store-pagination" aria-label="Paginacao de produtos">
+                  <button
+                    type="button"
+                    className="store-pagination-btn"
+                    onClick={() => handlePageChange(safeCurrentPage - 1)}
+                    disabled={safeCurrentPage === 1}
+                  >
+                    Anterior
+                  </button>
+
+                  <div className="store-pagination-pages">
+                    {paginationItems.map((item) => (
+                      typeof item === 'number' ? (
+                        <button
+                          type="button"
+                          key={item}
+                          className={`store-pagination-page ${item === safeCurrentPage ? 'is-active' : ''}`}
+                          onClick={() => handlePageChange(item)}
+                          aria-current={item === safeCurrentPage ? 'page' : undefined}
+                        >
+                          {item}
+                        </button>
+                      ) : (
+                        <span className="store-pagination-gap" key={item}>...</span>
+                      )
+                    ))}
+                  </div>
+
+                  <button
+                    type="button"
+                    className="store-pagination-btn"
+                    onClick={() => handlePageChange(safeCurrentPage + 1)}
+                    disabled={safeCurrentPage === totalPages}
+                  >
+                    Proxima
+                  </button>
+                </nav>
+              ) : null}
             </section>
           </div>
         </div>
@@ -286,6 +397,7 @@ export default function StorePage() {
         onClose={() => setCartOpen(false)}
         onUpdateQuantity={updateQuantity}
         onRemove={removeItem}
+        onReplaceItems={replaceItems}
       />
 
       <ProductModal

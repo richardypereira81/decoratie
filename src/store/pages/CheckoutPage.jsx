@@ -3,7 +3,16 @@ import { Link } from 'react-router-dom'
 import { useCart } from '../hooks/useCart.js'
 import { useOrders } from '../hooks/useOrders.js'
 import { formatCurrency } from '../../shared/formatters.js'
+import { PIX_DISCOUNT_PERCENT, calculatePaymentTotals } from '../../shared/pricing.js'
+import {
+  buildLocalCouponApplication,
+  isValidCouponCode,
+  normalizeCouponCode,
+  validateCoupon,
+} from '../../shared/couponApi.js'
+import { fetchCustomerByEmail, normalizeCustomerEmail } from '../../shared/customerApi.js'
 import { quoteFreight } from '../../shared/freightApi.js'
+import { buildCartStockMessage, isCartStockConflict } from '../../shared/cartStockApi.js'
 import {
   consultMercadoPagoCheckoutPayment,
   createMercadoPagoPayment,
@@ -130,6 +139,17 @@ function triggerOrderNotification(pedidoId, notificationToken) {
   })
 }
 
+function getCheckoutItemUnitKey(item) {
+  return [
+    item?.variacaoId,
+    item?.skuId,
+  ].map((value) => String(value || '').trim()).filter(Boolean).join('|')
+}
+
+function getCheckoutItemKey(item) {
+  return `${String(item?.produtoId || '').trim()}::${getCheckoutItemUnitKey(item)}`
+}
+
 function formatCpfCnpj(value) {
   const digits = getDigits(value).slice(0, 14)
 
@@ -173,6 +193,35 @@ function formatCep(value) {
   }
 
   return `${digits.slice(0, 5)}-${digits.slice(5)}`
+}
+
+function keepCurrentOrFill(currentValue, nextValue) {
+  const currentText = String(currentValue || '').trim()
+  const nextText = String(nextValue || '').trim()
+
+  return currentText ? currentValue : nextText
+}
+
+function mergeCustomerIntoEmptyCheckoutFields(currentForm, customer) {
+  const endereco = customer?.endereco || {}
+  const documentValue = customer?.documentoLimpo || customer?.cpfNormalizado || customer?.documento || ''
+
+  return {
+    ...currentForm,
+    nome: keepCurrentOrFill(currentForm.nome, customer?.nome),
+    telefone: keepCurrentOrFill(currentForm.telefone, customer?.telefone),
+    documento: keepCurrentOrFill(
+      currentForm.documento,
+      documentValue ? formatCpfCnpj(documentValue) : ''
+    ),
+    cep: keepCurrentOrFill(currentForm.cep, endereco.cep ? formatCep(endereco.cep) : ''),
+    rua: keepCurrentOrFill(currentForm.rua, endereco.rua),
+    numero: keepCurrentOrFill(currentForm.numero, endereco.numero),
+    complemento: keepCurrentOrFill(currentForm.complemento, endereco.complemento),
+    bairro: keepCurrentOrFill(currentForm.bairro, endereco.bairro),
+    cidade: keepCurrentOrFill(currentForm.cidade, endereco.cidade),
+    estado: keepCurrentOrFill(currentForm.estado, String(endereco.estado || '').trim().toUpperCase()),
+  }
 }
 
 async function fetchJson(url, options = {}) {
@@ -633,7 +682,7 @@ function buildFreightPayload(option, cepDestino) {
 }
 
 export default function CheckoutPage() {
-  const { items, clearCart } = useCart()
+  const { items, clearCart, replaceItems } = useCart()
   const { createOrder, submitting, error: submitError } = useOrders()
   const [form, setForm] = useState(emptyForm)
   const [shippingOptions, setShippingOptions] = useState([])
@@ -649,8 +698,14 @@ export default function CheckoutPage() {
   const [paymentConfigError, setPaymentConfigError] = useState('')
   const [paymentMethod, setPaymentMethod] = useState('')
   const [paymentProcessing, setPaymentProcessing] = useState(false)
+  const [checkoutStage, setCheckoutStage] = useState('')
   const [paymentError, setPaymentError] = useState('')
   const [checkoutSubmitError, setCheckoutSubmitError] = useState('')
+  const [couponCode, setCouponCode] = useState('')
+  const [appliedCoupon, setAppliedCoupon] = useState(null)
+  const [couponApplying, setCouponApplying] = useState(false)
+  const [couponFeedback, setCouponFeedback] = useState({ type: '', message: '' })
+  const [customerLookup, setCustomerLookup] = useState({ loading: false, message: '', email: '' })
   const [pixPollingChecking, setPixPollingChecking] = useState(false)
   const [pixPollingMessage, setPixPollingMessage] = useState('')
   const [pixPollingError, setPixPollingError] = useState('')
@@ -744,12 +799,17 @@ export default function CheckoutPage() {
           preco: Number(item?.preco) || 0,
           quantidade: Math.max(1, Number.parseInt(item?.quantidade, 10) || 1),
           imagem: typeof item?.imagem === 'string' ? item.imagem : '',
+          variacaoId: String(item?.variacaoId || '').trim(),
+          skuId: String(item?.skuId || '').trim(),
+          variacaoNome: String(item?.variacaoNome || '').trim(),
+          skuNome: String(item?.skuNome || '').trim(),
         }
+        const itemKey = getCheckoutItemKey(normalizedItem)
 
-        const existingItem = map.get(produtoId)
+        const existingItem = map.get(itemKey)
 
         if (existingItem) {
-          map.set(produtoId, {
+          map.set(itemKey, {
             ...existingItem,
             quantidade: existingItem.quantidade + normalizedItem.quantidade,
           })
@@ -757,7 +817,7 @@ export default function CheckoutPage() {
           return map
         }
 
-        map.set(produtoId, normalizedItem)
+        map.set(itemKey, normalizedItem)
         return map
       }, new Map()).values()
     ),
@@ -793,20 +853,116 @@ export default function CheckoutPage() {
     [cartItems]
   )
 
+  const freightAmount = useMemo(
+    () => getFreightAmount(selectedShipping) ?? 0,
+    [selectedShipping]
+  )
+
+  const displayCoupon = useMemo(
+    () => buildLocalCouponApplication(appliedCoupon, subtotal),
+    [appliedCoupon, subtotal]
+  )
+  const couponDiscount = Number(displayCoupon?.valorDesconto || 0)
+
+  const paymentTotals = useMemo(
+    () => calculatePaymentTotals({
+      subtotal,
+      freight: freightAmount,
+      method: paymentMethod,
+      couponDiscount,
+    }),
+    [couponDiscount, freightAmount, paymentMethod, subtotal],
+  )
+
+  const pixDiscount = paymentTotals.discount
+  const totalBeforeDiscount = paymentTotals.baseTotal
   const total = useMemo(
-    () => subtotal + (getFreightAmount(selectedShipping) ?? 0),
-    [subtotal, selectedShipping]
+    () => paymentTotals.total,
+    [paymentTotals.total]
   )
 
   const quoteItemsKey = useMemo(
-    () => cartItems.map((item) => `${item.produtoId}:${item.quantidade}`).join('|'),
+    () => cartItems.map((item) => `${getCheckoutItemKey(item)}:${item.quantidade}`).join('|'),
     [cartItems]
   )
+
+  const checkoutSubmitLabel = useMemo(() => {
+    if (checkoutStage === 'stock' || submitting) {
+      return 'Validando estoque...'
+    }
+
+    if (checkoutStage === 'payment' || paymentProcessing) {
+      return 'Processando pagamento...'
+    }
+
+    return `Finalizar pedido - ${formatCurrency(total)}`
+  }, [checkoutStage, paymentProcessing, submitting, total])
 
   const checkoutStyle = useMemo(
     () => ({ '--store-checkout-header-offset': `${headerHeight}px` }),
     [headerHeight]
   )
+
+  const normalizedCheckoutEmail = useMemo(
+    () => normalizeCustomerEmail(form.email),
+    [form.email]
+  )
+
+  useEffect(() => {
+    const email = normalizedCheckoutEmail
+
+    if (!email || !EMAIL_REGEX.test(email)) {
+      setCustomerLookup({ loading: false, message: '', email: '' })
+      return undefined
+    }
+
+    let cancelled = false
+
+    setCustomerLookup({ loading: true, message: '', email })
+
+    const timeout = window.setTimeout(async () => {
+      try {
+        const customer = await fetchCustomerByEmail(email)
+
+        if (cancelled) {
+          return
+        }
+
+        if (!customer) {
+          setCustomerLookup({ loading: false, message: '', email })
+          return
+        }
+
+        setForm((currentForm) => {
+          if (normalizeCustomerEmail(currentForm.email) !== email) {
+            return currentForm
+          }
+
+          return mergeCustomerIntoEmptyCheckoutFields(currentForm, customer)
+        })
+        setCustomerLookup({
+          loading: false,
+          message: 'Cadastro encontrado. Campos vazios preenchidos automaticamente.',
+          email,
+        })
+      } catch (error) {
+        if (cancelled) {
+          return
+        }
+
+        console.warn('[checkout] busca de cliente por e-mail falhou', {
+          code: error.code || 'cliente_busca_erro',
+          message: error.message,
+        })
+        setCustomerLookup({ loading: false, message: '', email })
+      }
+    }, 550)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(timeout)
+    }
+  }, [normalizedCheckoutEmail])
 
   useEffect(() => {
     const cepDestino = getDigits(form.cep)
@@ -1263,6 +1419,66 @@ export default function CheckoutPage() {
     }))
   }
 
+  function handleCouponCodeChange(value) {
+    setCouponCode(value)
+    setCouponFeedback({ type: '', message: '' })
+    setCheckoutSubmitError('')
+  }
+
+  async function handleApplyCoupon(event) {
+    event?.preventDefault?.()
+    const normalizedCode = normalizeCouponCode(couponCode)
+
+    if (!normalizedCode || !isValidCouponCode(normalizedCode)) {
+      setCouponFeedback({ type: 'error', message: 'Informe um cupom valido.' })
+      return
+    }
+
+    if (subtotal <= 0) {
+      setCouponFeedback({ type: 'error', message: 'Adicione produtos ao carrinho antes de aplicar cupom.' })
+      return
+    }
+
+    const couponEmail = EMAIL_REGEX.test(normalizedCheckoutEmail) ? normalizedCheckoutEmail : ''
+    const couponCpf = isValidCpfCnpj(form.documento) ? getDigits(form.documento) : ''
+
+    if (!couponEmail && !couponCpf) {
+      setCouponFeedback({ type: 'error', message: 'Informe CPF ou e-mail para aplicar o cupom.' })
+      return
+    }
+
+    setCouponApplying(true)
+    setCouponFeedback({ type: '', message: '' })
+
+    try {
+      const coupon = await validateCoupon({
+        codigo: normalizedCode,
+        subtotal,
+        email: couponEmail,
+        cpf: couponCpf,
+      })
+      setAppliedCoupon(coupon)
+      setCouponCode(coupon.codigo)
+      setCouponFeedback({ type: 'success', message: 'Cupom aplicado com sucesso!' })
+      setCheckoutSubmitError('')
+    } catch (error) {
+      setAppliedCoupon(null)
+      setCouponFeedback({
+        type: 'error',
+        message: error.message || 'Nao foi possivel validar o cupom.',
+      })
+    } finally {
+      setCouponApplying(false)
+    }
+  }
+
+  function handleRemoveCoupon() {
+    setAppliedCoupon(null)
+    setCouponCode('')
+    setCouponFeedback({ type: '', message: '' })
+    setCheckoutSubmitError('')
+  }
+
   function validate() {
     const nextErrors = {}
     const phoneDigits = getDigits(form.telefone)
@@ -1369,6 +1585,7 @@ export default function CheckoutPage() {
 
     setCheckoutSubmitError('')
     setPaymentProcessing(true)
+    setCheckoutStage('stock')
 
     try {
       let cardPayload = null
@@ -1404,9 +1621,17 @@ export default function CheckoutPage() {
           preco: item.preco,
           quantidade: item.quantidade,
           imagem: item.imagem,
+          variacaoId: item.variacaoId,
+          skuId: item.skuId,
+          variacaoNome: item.variacaoNome,
+          skuNome: item.skuNome,
         })),
         frete,
         subtotal,
+        desconto: pixDiscount,
+        descontoPercentual: paymentTotals.discountPercent,
+        totalSemDesconto: totalBeforeDiscount,
+        cupomCodigo: displayCoupon?.codigo || '',
         total,
         status: mercadoPagoActive ? 'aguardando_pagamento' : 'pendente',
         pagamento: mercadoPagoActive ? {
@@ -1414,6 +1639,10 @@ export default function CheckoutPage() {
           metodo: paymentMethod,
           status: 'creating',
           valor: total,
+          desconto: pixDiscount,
+          descontoPercentual: paymentTotals.discountPercent,
+          valorSemDesconto: totalBeforeDiscount,
+          cupomCodigo: displayCoupon?.codigo || '',
           createdAt: new Date().toISOString(),
         } : null,
         notificationToken,
@@ -1430,6 +1659,8 @@ export default function CheckoutPage() {
         setOrderComplete({ id: orderId, status: 'pendente', pagamento: null })
         return
       }
+
+      setCheckoutStage('payment')
 
       const paymentResult = await createMercadoPagoPayment({
         pedidoId: orderId,
@@ -1453,11 +1684,25 @@ export default function CheckoutPage() {
         pagamento: paymentResult.pagamento,
       })
     } catch (error) {
+      if (isCartStockConflict(error)) {
+        const updatedCart = error?.details?.carrinhoAtualizado
+
+        if (Array.isArray(updatedCart)) {
+          replaceItems(updatedCart)
+        }
+
+        const message = buildCartStockMessage(error)
+        setPaymentError('')
+        setCheckoutSubmitError(message)
+        return
+      }
+
       const message = error.message || 'Nao foi possivel processar o pagamento.'
       setPaymentError(message)
       setCheckoutSubmitError(message)
     } finally {
       setPaymentProcessing(false)
+      setCheckoutStage('')
     }
   }
 
@@ -1673,6 +1918,12 @@ export default function CheckoutPage() {
                     value={form.email}
                     onChange={(event) => update('email', event.target.value)}
                   />
+                  {customerLookup.loading && customerLookup.email === normalizedCheckoutEmail && (
+                    <span className="store-field-hint">Buscando cadastro...</span>
+                  )}
+                  {!customerLookup.loading && customerLookup.message && customerLookup.email === normalizedCheckoutEmail && (
+                    <span className="store-field-hint">{customerLookup.message}</span>
+                  )}
                   {errors.email && <span className="store-field-error">{errors.email}</span>}
                 </div>
 
@@ -1915,7 +2166,7 @@ export default function CheckoutPage() {
 
                 {mercadoPagoActive && paymentMethod === 'pix' ? (
                   <div className="store-payment-hint">
-                    O QR Code e o codigo Pix aparecem apos finalizar o pedido.
+                    Pix tem {PIX_DISCOUNT_PERCENT}% de desconto no total. O QR Code e o codigo aparecem apos finalizar.
                   </div>
                 ) : null}
 
@@ -2015,7 +2266,7 @@ export default function CheckoutPage() {
 
             <ul className="store-summary-items">
               {cartItems.map((item) => (
-                <li key={item.produtoId} className="store-summary-item">
+                <li key={getCheckoutItemKey(item)} className="store-summary-item">
                   <div className="store-summary-item-img">
                     {item.imagem ? (
                       <img src={item.imagem} alt={item.nome} loading="lazy" />
@@ -2043,12 +2294,60 @@ export default function CheckoutPage() {
                 <span>Subtotal</span>
                 <span>{formatCurrency(subtotal)}</span>
               </div>
+              <form className="store-coupon-box" onSubmit={handleApplyCoupon}>
+                <label htmlFor="store-coupon-code">Cupom de desconto</label>
+                <div className="store-coupon-row">
+                  <input
+                    id="store-coupon-code"
+                    className="store-input"
+                    value={couponCode}
+                    placeholder="Digite seu cupom"
+                    disabled={couponApplying || Boolean(displayCoupon)}
+                    onChange={(event) => handleCouponCodeChange(event.target.value)}
+                  />
+                  {displayCoupon ? (
+                    <button
+                      type="button"
+                      className="store-btn store-btn-secondary store-coupon-action"
+                      onClick={handleRemoveCoupon}
+                    >
+                      Remover
+                    </button>
+                  ) : (
+                    <button
+                      type="submit"
+                      className="store-btn store-btn-secondary store-coupon-action"
+                      disabled={couponApplying || cartItems.length === 0}
+                      aria-busy={couponApplying}
+                    >
+                      {couponApplying ? 'Aplicando...' : 'Aplicar'}
+                    </button>
+                  )}
+                </div>
+                {couponFeedback.message ? (
+                  <span className={`store-coupon-feedback is-${couponFeedback.type}`}>
+                    {couponFeedback.message}
+                  </span>
+                ) : null}
+              </form>
+              {displayCoupon ? (
+                <div className="store-summary-line store-summary-discount">
+                  <span>Cupom {displayCoupon.codigo}</span>
+                  <span>-{formatCurrency(paymentTotals.couponDiscount)}</span>
+                </div>
+              ) : null}
               <div className="store-summary-line">
                 <span>Frete ({getFreightLabel(selectedShipping)})</span>
                 <span>
                   {getFreightPriceLabel(selectedShipping)}
                 </span>
               </div>
+              {pixDiscount > 0 ? (
+                <div className="store-summary-line store-summary-discount">
+                  <span>Desconto Pix ({PIX_DISCOUNT_PERCENT}%)</span>
+                  <span>-{formatCurrency(pixDiscount)}</span>
+                </div>
+              ) : null}
               <div className="store-summary-line store-summary-total">
                 <span>Total</span>
                 <strong>{formatCurrency(total)}</strong>
@@ -2070,7 +2369,7 @@ export default function CheckoutPage() {
                 onClick={handleFinalizeOrder}
                 aria-busy={submitting || paymentProcessing}
               >
-                {submitting || paymentProcessing ? 'Processando pagamento...' : `Finalizar pedido - ${formatCurrency(total)}`}
+                {checkoutSubmitLabel}
               </button>
             </div>
           </aside>

@@ -1,8 +1,9 @@
 import { NavLink } from 'react-router-dom'
 import {
+  CalendarIcon,
   CloseIcon,
+  CouponIcon,
   DashboardIcon,
-  LeadsIcon,
   LogoutIcon,
   OperationIcon,
   OrdersIcon,
@@ -33,9 +34,14 @@ const navigationItems = [
     icon: OrdersIcon,
   },
   {
-    to: '/admin/leads',
-    label: 'Leads',
-    icon: LeadsIcon,
+    to: '/admin/cupons',
+    label: 'Cupons',
+    icon: CouponIcon,
+  },
+  {
+    to: '/admin/agenda',
+    label: 'Agenda',
+    icon: CalendarIcon,
   },
   {
     to: '/admin/configuracoes',

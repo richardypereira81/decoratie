@@ -19,6 +19,25 @@ function toQuantityValue(value) {
   return Number.isFinite(quantity) && quantity > 0 ? quantity : 1
 }
 
+function toOptionalText(value) {
+  return String(value ?? '').trim()
+}
+
+function getCartItemUnitKey(item) {
+  return [
+    item?.variacaoId,
+    item?.skuId,
+  ].map(toOptionalText).filter(Boolean).join('|')
+}
+
+function buildCartItemKey(produtoId, unitKey = '') {
+  return `${String(produtoId || '').trim()}::${String(unitKey || '').trim()}`
+}
+
+function getCartItemKey(item) {
+  return buildCartItemKey(item?.produtoId ?? item?.id, getCartItemUnitKey(item))
+}
+
 function normalizeCartItems(items) {
   if (!Array.isArray(items)) {
     return []
@@ -37,12 +56,17 @@ function normalizeCartItems(items) {
       preco: toCurrencyValue(item?.precoVenda ?? item?.preco),
       quantidade: toQuantityValue(item?.quantidade),
       imagem: typeof item?.imagem === 'string' ? item.imagem : '',
+      variacaoId: toOptionalText(item?.variacaoId ?? item?.variationId),
+      skuId: toOptionalText(item?.skuId ?? item?.sku),
+      variacaoNome: toOptionalText(item?.variacaoNome ?? item?.variationName),
+      skuNome: toOptionalText(item?.skuNome ?? item?.skuName),
     }
+    const itemKey = getCartItemKey(normalizedItem)
 
-    const existingItem = map.get(produtoId)
+    const existingItem = map.get(itemKey)
 
     if (existingItem) {
-      map.set(produtoId, {
+      map.set(itemKey, {
         ...existingItem,
         quantidade: existingItem.quantidade + normalizedItem.quantidade,
         nome: existingItem.nome === 'Produto' ? normalizedItem.nome : existingItem.nome,
@@ -53,7 +77,7 @@ function normalizeCartItems(items) {
       return map
     }
 
-    map.set(produtoId, normalizedItem)
+    map.set(itemKey, normalizedItem)
     return map
   }, new Map())
 
@@ -71,6 +95,10 @@ function createCartItem(product, quantity) {
     preco: toCurrencyValue(product?.precoVenda ?? product?.preco),
     quantidade: toQuantityValue(quantity),
     imagem: typeof product?.imagem === 'string' ? product.imagem : '',
+    variacaoId: toOptionalText(product?.variacaoId ?? product?.variationId),
+    skuId: toOptionalText(product?.skuId ?? product?.sku),
+    variacaoNome: toOptionalText(product?.variacaoNome ?? product?.variationName),
+    skuNome: toOptionalText(product?.skuNome ?? product?.skuName),
   }
 }
 
@@ -114,7 +142,9 @@ export function useCart() {
 
     const quantityToAdd = toQuantityValue(quantity)
     const current = readCart()
-    const index = current.findIndex((i) => i.produtoId === produtoId)
+    const productItem = createCartItem(product, quantityToAdd)
+    const itemKey = getCartItemKey(productItem)
+    const index = current.findIndex((i) => getCartItemKey(i) === itemKey)
 
     if (index >= 0) {
       const updated = [...current]
@@ -124,26 +154,32 @@ export function useCart() {
       }
       writeCart(updated)
     } else {
-      writeCart([...current, createCartItem(product, quantityToAdd)])
+      writeCart([...current, productItem])
     }
   }, [])
 
-  const removeItem = useCallback((produtoId) => {
-    writeCart(readCart().filter((i) => i.produtoId !== produtoId))
+  const removeItem = useCallback((produtoId, unitKey = '') => {
+    const itemKey = buildCartItemKey(produtoId, unitKey)
+    writeCart(readCart().filter((i) => getCartItemKey(i) !== itemKey))
   }, [])
 
-  const updateQuantity = useCallback((produtoId, quantidade) => {
+  const updateQuantity = useCallback((produtoId, quantidade, unitKey = '') => {
     const nextQuantity = Number.parseInt(quantidade, 10)
+    const itemKey = buildCartItemKey(produtoId, unitKey)
 
     if (!Number.isFinite(nextQuantity) || nextQuantity < 1) {
-      writeCart(readCart().filter((i) => i.produtoId !== produtoId))
+      writeCart(readCart().filter((i) => getCartItemKey(i) !== itemKey))
       return
     }
 
     const updated = readCart().map((i) =>
-      i.produtoId === produtoId ? { ...i, quantidade: nextQuantity } : i
+      getCartItemKey(i) === itemKey ? { ...i, quantidade: nextQuantity } : i
     )
     writeCart(updated)
+  }, [])
+
+  const replaceItems = useCallback((nextItems = []) => {
+    writeCart(nextItems)
   }, [])
 
   const clearCart = useCallback(() => {
@@ -153,5 +189,14 @@ export function useCart() {
   const totalItems = useMemo(() => items.reduce((sum, i) => sum + i.quantidade, 0), [items])
   const totalPrice = useMemo(() => items.reduce((sum, i) => sum + i.preco * i.quantidade, 0), [items])
 
-  return { items, addItem, removeItem, updateQuantity, clearCart, totalItems, totalPrice }
+  return {
+    items,
+    addItem,
+    removeItem,
+    updateQuantity,
+    replaceItems,
+    clearCart,
+    totalItems,
+    totalPrice,
+  }
 }

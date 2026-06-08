@@ -16,10 +16,14 @@ import { useCollectionData } from '../hooks/useFirestoreData.js'
 import { useAuthSession } from '../AuthContext.jsx'
 import { useAdminUI } from '../components/AdminLayout.jsx'
 import SearchInput from '../components/SearchInput.jsx'
-import Toolbar from '../components/Toolbar.jsx'
 import DataTable from '../components/DataTable.jsx'
 import Modal from '../components/Modal.jsx'
 import { EyeIcon, MessageCircleIcon, MoreIcon, PrinterIcon, SendIcon } from '../components/AdminIcons.jsx'
+import {
+  cancelAgendaForPickupOrder,
+  canSchedulePickupOrder,
+  upsertAgendaForPickupOrder,
+} from '../services/agendaService.js'
 
 const STATUS_OPTIONS = [
   { value: 'all', label: 'Todos' },
@@ -43,6 +47,13 @@ const STATUS_COLORS = {
   entregue: 'is-live',
   cancelado: 'is-muted',
 }
+
+const DATE_PRESET_OPTIONS = [
+  { value: 'day', label: 'Dia' },
+  { value: 'month', label: 'Mes' },
+  { value: 'year', label: 'Ano' },
+  { value: 'custom', label: 'Personalizado' },
+]
 
 function getStatusLabel(status) {
   return STATUS_OPTIONS.find((option) => option.value === status)?.label || status || '--'
@@ -257,6 +268,46 @@ function getDateFilterBoundary(value, endOfDay = false) {
     : new Date(year, month - 1, day, 0, 0, 0, 0).getTime()
 }
 
+function formatDateInputValue(date) {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+
+  return `${year}-${month}-${day}`
+}
+
+function getDatePresetRange(preset) {
+  const today = new Date()
+  const to = formatDateInputValue(today)
+
+  if (preset === 'day') {
+    return { from: to, to }
+  }
+
+  if (preset === 'month') {
+    return { from: formatDateInputValue(new Date(today.getFullYear(), today.getMonth(), 1)), to }
+  }
+
+  if (preset === 'year') {
+    return { from: formatDateInputValue(new Date(today.getFullYear(), 0, 1)), to }
+  }
+
+  return { from: '', to: '' }
+}
+
+function getActiveDatePreset(dateFrom, dateTo) {
+  if (!dateFrom && !dateTo) {
+    return ''
+  }
+
+  const matchedPreset = ['day', 'month', 'year'].find((preset) => {
+    const range = getDatePresetRange(preset)
+    return range.from === dateFrom && range.to === dateTo
+  })
+
+  return matchedPreset || 'custom'
+}
+
 function formatDateInputLabel(value) {
   if (!value) {
     return ''
@@ -280,8 +331,9 @@ function getPickupSchedule(frete) {
   const data = String(schedule.data || schedule.date || frete?.dataRetirada || '').trim()
   const hora = String(schedule.hora || schedule.time || frete?.horaRetirada || '').trim()
   const texto = String(schedule.texto || schedule.label || '').trim()
+  const observacoes = String(schedule.observacoes || schedule.obs || schedule.note || '').trim()
 
-  return { data, hora, texto }
+  return { data, hora, observacoes, texto }
 }
 
 function buildPickupScheduleLabel(data, hora) {
@@ -344,6 +396,56 @@ function getOrderSubtotal(order) {
   }
 
   return getOrderItems(order).reduce((sum, item) => sum + getItemTotal(item), 0)
+}
+
+function getOrderDiscount(order) {
+  const discount = Number(order?.desconto ?? order?.discount ?? 0)
+  return Number.isFinite(discount) && discount > 0 ? discount : 0
+}
+
+function getOrderCoupon(order) {
+  return order?.cupom && typeof order.cupom === 'object' ? order.cupom : null
+}
+
+function getOrderCouponCode(order) {
+  return String(getOrderCoupon(order)?.codigo || order?.cupomCodigo || '').trim()
+}
+
+function getOrderCouponPercent(order) {
+  const percent = Number(
+    getOrderCoupon(order)?.percentual ??
+    order?.descontoCupomPercentual ??
+    0
+  )
+  return Number.isFinite(percent) && percent > 0 ? percent : 0
+}
+
+function getOrderCouponDiscount(order) {
+  const discount = Number(
+    getOrderCoupon(order)?.valorDesconto ??
+    order?.valorDescontoCupom ??
+    0
+  )
+  return Number.isFinite(discount) && discount > 0 ? discount : 0
+}
+
+function getOrderFreightValue(order) {
+  if (!order?.frete || order.frete.valorPendente) {
+    return 0
+  }
+
+  const value = Number(order.frete.valorFinal ?? order.frete.valor ?? 0)
+  return Number.isFinite(value) && value > 0 ? value : 0
+}
+
+function getOrderTotalBeforeDiscounts(order) {
+  const savedTotal = Number(order?.totalSemDesconto ?? order?.totalAntesDescontos)
+
+  if (Number.isFinite(savedTotal) && savedTotal >= 0) {
+    return savedTotal
+  }
+
+  return getOrderSubtotal(order) + getOrderFreightValue(order)
 }
 
 function getFreteValueLabel(frete) {
@@ -625,6 +727,7 @@ export default function OrdersPage() {
   const [statusFilter, setStatusFilter] = useState('all')
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo] = useState('')
+  const [datePresetMode, setDatePresetMode] = useState('')
   const [detailOrder, setDetailOrder] = useState(null)
   const [consultingPayment, setConsultingPayment] = useState(false)
   const [resendingNotificationId, setResendingNotificationId] = useState('')
@@ -633,6 +736,7 @@ export default function OrdersPage() {
   const [pickupScheduleOrder, setPickupScheduleOrder] = useState(null)
   const [pickupScheduleDate, setPickupScheduleDate] = useState('')
   const [pickupScheduleTime, setPickupScheduleTime] = useState('')
+  const [pickupScheduleNotes, setPickupScheduleNotes] = useState('')
   const [savingPickupSchedule, setSavingPickupSchedule] = useState(false)
   const [trackingOrder, setTrackingOrder] = useState(null)
   const [trackingCode, setTrackingCode] = useState('')
@@ -730,6 +834,39 @@ export default function OrdersPage() {
       return sum + (Number.isFinite(total) ? total : 0)
     }, 0)
   }, [filteredOrders])
+
+  const activeDatePreset = useMemo(() => {
+    return getActiveDatePreset(dateFrom, dateTo) || datePresetMode
+  }, [dateFrom, datePresetMode, dateTo])
+  const hasDateFilter = Boolean(dateFrom || dateTo)
+
+  function applyDatePreset(preset) {
+    setDatePresetMode(preset)
+
+    if (preset === 'custom') {
+      return
+    }
+
+    const range = getDatePresetRange(preset)
+    setDateFrom(range.from)
+    setDateTo(range.to)
+  }
+
+  function clearDateFilter() {
+    setDatePresetMode('')
+    setDateFrom('')
+    setDateTo('')
+  }
+
+  function handleDateFromChange(value) {
+    setDatePresetMode('custom')
+    setDateFrom(value)
+  }
+
+  function handleDateToChange(value) {
+    setDatePresetMode('custom')
+    setDateTo(value)
+  }
 
   async function updateStatus(orderId, newStatus) {
     const currentOrder = orders.find((order) => order.id === orderId) ||
@@ -852,11 +989,23 @@ export default function OrdersPage() {
   }
 
   function openPickupSchedule(order) {
+    const hasPickupSchedule = Boolean(getPickupScheduleLabel(order.frete))
+
+    if (!canSchedulePickupOrder(order) && !hasPickupSchedule) {
+      notify({
+        type: 'error',
+        title: 'Pagamento ainda nao aprovado',
+        description: 'A retirada so pode ser agendada depois que o pagamento for aprovado.',
+      })
+      return
+    }
+
     const schedule = getPickupSchedule(order.frete)
 
     setPickupScheduleOrder(order)
     setPickupScheduleDate(schedule.data)
     setPickupScheduleTime(schedule.hora)
+    setPickupScheduleNotes(schedule.observacoes || '')
   }
 
   function closePickupSchedule(force = false) {
@@ -867,12 +1016,22 @@ export default function OrdersPage() {
     setPickupScheduleOrder(null)
     setPickupScheduleDate('')
     setPickupScheduleTime('')
+    setPickupScheduleNotes('')
   }
 
   async function savePickupSchedule(event) {
     event.preventDefault()
 
     if (!pickupScheduleOrder?.id) {
+      return
+    }
+
+    if (!canSchedulePickupOrder(pickupScheduleOrder)) {
+      notify({
+        type: 'error',
+        title: 'Pagamento ainda nao aprovado',
+        description: 'A retirada so pode ser agendada depois que o pagamento for aprovado.',
+      })
       return
     }
 
@@ -893,6 +1052,7 @@ export default function OrdersPage() {
       'frete.agendamentoRetirada.data': pickupScheduleDate,
       'frete.agendamentoRetirada.hora': pickupScheduleTime,
       'frete.agendamentoRetirada.texto': texto,
+      'frete.agendamentoRetirada.observacoes': pickupScheduleNotes.trim(),
       'frete.agendamentoRetirada.updatedAt': serverTimestamp(),
       'frete.agendamentoRetirada.updatedBy': user?.uid || '',
       'frete.prazoTexto': texto,
@@ -907,6 +1067,12 @@ export default function OrdersPage() {
 
     try {
       await updateDoc(doc(db, 'pedidos', pickupScheduleOrder.id), payload)
+      await upsertAgendaForPickupOrder(pickupScheduleOrder, {
+        data: pickupScheduleDate,
+        hora: pickupScheduleTime,
+        observacoes: pickupScheduleNotes,
+        userId: user?.uid || '',
+      })
       notify({
         type: 'success',
         title: 'Retirada agendada',
@@ -939,6 +1105,7 @@ export default function OrdersPage() {
         'frete.prazoTexto': fallbackText,
         updatedAt: serverTimestamp(),
       })
+      await cancelAgendaForPickupOrder(pickupScheduleOrder, { userId: user?.uid || '' })
       notify({
         type: 'success',
         title: 'Agendamento removido',
@@ -1248,10 +1415,16 @@ export default function OrdersPage() {
       key: 'frete',
       header: 'Entrega/retirada',
       cell: (order) => {
+        const paymentApproved = canSchedulePickupOrder(order)
+        const hasPickupSchedule = Boolean(getPickupScheduleLabel(order.frete))
         const content = (
           <>
             <strong>{getFreteLabel(order.frete)}</strong>
-            <span>{getFretePrazo(order.frete)}</span>
+            <span>
+              {!paymentApproved && !hasPickupSchedule
+                ? 'Aguardando pagamento para agendar'
+                : getFretePrazo(order.frete)}
+            </span>
           </>
         )
 
@@ -1261,6 +1434,8 @@ export default function OrdersPage() {
               type="button"
               className="admin-pickup-schedule-trigger"
               onClick={() => openPickupSchedule(order)}
+              disabled={!paymentApproved && !hasPickupSchedule}
+              title={!paymentApproved ? 'A retirada so pode ser agendada apos o pagamento aprovado.' : undefined}
               aria-label={`Agendar retirada de ${getOrderLabel(order)}`}
             >
               {content}
@@ -1344,6 +1519,10 @@ export default function OrdersPage() {
     },
   ]
 
+  const pickupSchedulePaymentApproved = pickupScheduleOrder ? canSchedulePickupOrder(pickupScheduleOrder) : false
+  const pickupScheduleHasCurrent = pickupScheduleOrder
+    ? Boolean(getPickupScheduleLabel(pickupScheduleOrder.frete))
+    : false
   const detailAddressLines = formatAddressLines(detailOrder?.cliente?.endereco)
   const detailOrderItems = getOrderItems(detailOrder)
 
@@ -1355,49 +1534,79 @@ export default function OrdersPage() {
         </div>
       </div>
 
-      <Toolbar
-        search={
-          <SearchInput
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Buscar por cliente, email, telefone ou numero..."
-            ariaLabel="Buscar pedidos"
-          />
-        }
-        filters={
-          <div className="admin-toolbar-filters">
-            <div className="admin-order-date-filters" aria-label="Filtrar pedidos por data">
-              <label className="admin-date-field">
-                <span>De</span>
-                <input
-                  type="date"
-                  value={dateFrom}
-                  max={dateTo || undefined}
-                  onChange={(event) => setDateFrom(event.target.value)}
-                />
-              </label>
-              <label className="admin-date-field">
-                <span>Ate</span>
-                <input
-                  type="date"
-                  value={dateTo}
-                  min={dateFrom || undefined}
-                  onChange={(event) => setDateTo(event.target.value)}
-                />
-              </label>
-              {dateFrom || dateTo ? (
-                <button
-                  type="button"
-                  className="admin-date-clear"
-                  onClick={() => {
-                    setDateFrom('')
-                    setDateTo('')
-                  }}
-                >
-                  Limpar
-                </button>
-              ) : null}
+      <section className="admin-orders-filter-panel" aria-label="Filtros de pedidos">
+        <div className="admin-orders-filter-head">
+          <div className="admin-orders-filter-search">
+            <SearchInput
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Buscar por cliente, email, telefone ou numero..."
+              ariaLabel="Buscar pedidos"
+            />
+          </div>
+
+          <section className="admin-orders-total-bar" aria-label="Resumo dos pedidos exibidos">
+            <div>
+              <span>Pedidos exibidos</span>
+              <strong>{filteredOrders.length}</strong>
             </div>
+            <div>
+              <span>Total exibido</span>
+              <strong>{formatCurrency(filteredOrdersTotal)}</strong>
+            </div>
+          </section>
+        </div>
+
+        <div className="admin-orders-filter-body">
+          <div className="admin-orders-period-field">
+            <span className="admin-filter-label">Periodo</span>
+            <div className="admin-segmented-control" aria-label="Periodo dos pedidos">
+              {DATE_PRESET_OPTIONS.map((preset) => (
+                <button
+                  key={preset.value}
+                  type="button"
+                  className={`admin-segmented-btn ${activeDatePreset === preset.value ? 'is-active' : ''}`}
+                  onClick={() => applyDatePreset(preset.value)}
+                  aria-pressed={activeDatePreset === preset.value}
+                >
+                  {preset.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="admin-order-date-filters" aria-label="Filtrar pedidos por data">
+            <label className="admin-date-field">
+              <span>De</span>
+              <input
+                type="date"
+                value={dateFrom}
+                max={dateTo || undefined}
+                onChange={(event) => handleDateFromChange(event.target.value)}
+              />
+            </label>
+            <label className="admin-date-field">
+              <span>Ate</span>
+              <input
+                type="date"
+                value={dateTo}
+                min={dateFrom || undefined}
+                onChange={(event) => handleDateToChange(event.target.value)}
+              />
+            </label>
+            {hasDateFilter ? (
+              <button
+                type="button"
+                className="admin-date-clear"
+                onClick={clearDateFilter}
+              >
+                Limpar
+              </button>
+            ) : null}
+          </div>
+
+          <label className="admin-orders-status-field">
+            <span className="admin-filter-label">Status</span>
             <select
               className="admin-select admin-select-sm"
               value={statusFilter}
@@ -1407,18 +1616,7 @@ export default function OrdersPage() {
                 <option key={opt.value} value={opt.value}>{opt.label}</option>
               ))}
             </select>
-          </div>
-        }
-      />
-
-      <section className="admin-orders-total-bar" aria-label="Resumo dos pedidos exibidos">
-        <div>
-          <span>Pedidos exibidos</span>
-          <strong>{filteredOrders.length}</strong>
-        </div>
-        <div>
-          <span>Total exibido</span>
-          <strong>{formatCurrency(filteredOrdersTotal)}</strong>
+          </label>
         </div>
       </section>
 
@@ -1442,6 +1640,9 @@ export default function OrdersPage() {
             <div className="admin-inline-notice">
               <strong>{pickupScheduleOrder.cliente?.nome || 'Cliente'}</strong>
               <span>{getFreteLabel(pickupScheduleOrder.frete)}</span>
+              {!pickupSchedulePaymentApproved ? (
+                <span>Pagamento ainda nao aprovado. Remova o agendamento atual ou aguarde a aprovacao.</span>
+              ) : null}
             </div>
 
             <div className="admin-form-grid">
@@ -1452,6 +1653,7 @@ export default function OrdersPage() {
                   type="date"
                   value={pickupScheduleDate}
                   onChange={(event) => setPickupScheduleDate(event.target.value)}
+                  disabled={!pickupSchedulePaymentApproved || savingPickupSchedule}
                   required
                 />
               </label>
@@ -1463,7 +1665,20 @@ export default function OrdersPage() {
                   type="time"
                   value={pickupScheduleTime}
                   onChange={(event) => setPickupScheduleTime(event.target.value)}
+                  disabled={!pickupSchedulePaymentApproved || savingPickupSchedule}
                   required
+                />
+              </label>
+
+              <label className="admin-field admin-field-full">
+                <span>Observacao opcional</span>
+                <textarea
+                  className="admin-textarea"
+                  value={pickupScheduleNotes}
+                  onChange={(event) => setPickupScheduleNotes(event.target.value)}
+                  disabled={!pickupSchedulePaymentApproved || savingPickupSchedule}
+                  rows="3"
+                  placeholder="Ex.: cliente retira no balcao"
                 />
               </label>
             </div>
@@ -1475,7 +1690,7 @@ export default function OrdersPage() {
             ) : null}
 
             <div className="admin-modal-actions admin-pickup-schedule-actions">
-              {getPickupScheduleLabel(pickupScheduleOrder.frete) ? (
+              {pickupScheduleHasCurrent ? (
                 <button
                   type="button"
                   className="admin-btn-danger"
@@ -1493,7 +1708,7 @@ export default function OrdersPage() {
               >
                 Cancelar
               </button>
-              <button type="submit" className="admin-btn" disabled={savingPickupSchedule}>
+              <button type="submit" className="admin-btn" disabled={savingPickupSchedule || !pickupSchedulePaymentApproved}>
                 {savingPickupSchedule ? 'Salvando...' : 'Salvar agendamento'}
               </button>
             </div>
@@ -1608,6 +1823,18 @@ export default function OrdersPage() {
                   {detailOrder.pagamento?.metodo === 'credit_card' ? (
                     <ReportRow label="Parcelas" value={getPagamentoParcelasLabel(detailOrder.pagamento)} />
                   ) : null}
+                  {getOrderCouponCode(detailOrder) ? (
+                    <ReportRow
+                      label="Cupom"
+                      value={`${getOrderCouponCode(detailOrder)} (${getOrderCouponPercent(detailOrder)}%)`}
+                    />
+                  ) : null}
+                  {getOrderCouponDiscount(detailOrder) > 0 ? (
+                    <ReportRow label="Desconto do cupom" value={formatCurrency(getOrderCouponDiscount(detailOrder))} />
+                  ) : null}
+                  {(getOrderCouponDiscount(detailOrder) > 0 || getOrderDiscount(detailOrder) > 0) ? (
+                    <ReportRow label="Total antes dos descontos" value={formatCurrency(getOrderTotalBeforeDiscounts(detailOrder))} />
+                  ) : null}
                   <ReportRow label="Total" value={formatCurrency(detailOrder.total)} emphasis />
                 </ReportSection>
 
@@ -1670,10 +1897,22 @@ export default function OrdersPage() {
                   <span>Subtotal</span>
                   <strong>{formatCurrency(getOrderSubtotal(detailOrder))}</strong>
                 </div>
+                {getOrderCouponDiscount(detailOrder) > 0 ? (
+                  <div>
+                    <span>Cupom {getOrderCouponCode(detailOrder)} ({getOrderCouponPercent(detailOrder)}%)</span>
+                    <strong>-{formatCurrency(getOrderCouponDiscount(detailOrder))}</strong>
+                  </div>
+                ) : null}
                 <div>
                   <span>{getFreteLabel(detailOrder.frete)}</span>
                   <strong>{getFreteValueLabel(detailOrder.frete)}</strong>
                 </div>
+                {getOrderDiscount(detailOrder) > 0 ? (
+                  <div>
+                    <span>Desconto Pix</span>
+                    <strong>-{formatCurrency(getOrderDiscount(detailOrder))}</strong>
+                  </div>
+                ) : null}
                 {detailOrder.frete?.provider === 'melhor_envio' ? (
                   <>
                     <div>

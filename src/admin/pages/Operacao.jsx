@@ -274,6 +274,7 @@ export default function Operacao() {
             onClear={() => setFilters(initialFilters)}
           />
         }
+        recordCount={filteredNotas.length}
         actions={
           <ActionsDropdown
             items={actionItems}

@@ -1,12 +1,49 @@
 import { memo, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { buildCartStockMessage, isCartStockConflict, validateCartStock } from '../../shared/cartStockApi.js'
 import { formatCurrency } from '../../shared/formatters.js'
 import { CloseIcon, TrashIcon } from './StoreIcons.jsx'
 import QuantitySelector from './QuantitySelector.jsx'
 
-function CartSidebar({ open, items, totalItems, totalPrice, onClose, onUpdateQuantity, onRemove }) {
+function getItemUnitKey(item) {
+  return [
+    item?.variacaoId,
+    item?.skuId,
+  ].map((value) => String(value || '').trim()).filter(Boolean).join('|')
+}
+
+function getItemKey(item) {
+  return `${String(item?.produtoId || '').trim()}::${getItemUnitKey(item)}`
+}
+
+function buildCheckoutItemsPayload(items) {
+  return items.map((item) => ({
+    produtoId: item.produtoId,
+    nome: item.nome,
+    preco: item.preco,
+    quantidade: item.quantidade,
+    imagem: item.imagem,
+    variacaoId: item.variacaoId,
+    skuId: item.skuId,
+    variacaoNome: item.variacaoNome,
+    skuNome: item.skuNome,
+  }))
+}
+
+function CartSidebar({
+  open,
+  items,
+  totalItems,
+  totalPrice,
+  onClose,
+  onUpdateQuantity,
+  onRemove,
+  onReplaceItems,
+}) {
   const navigate = useNavigate()
   const [itemPendingRemoval, setItemPendingRemoval] = useState(null)
+  const [checkoutValidating, setCheckoutValidating] = useState(false)
+  const [checkoutError, setCheckoutError] = useState('')
 
   useEffect(() => {
     if (!open) return undefined
@@ -24,6 +61,7 @@ function CartSidebar({ open, items, totalItems, totalPrice, onClose, onUpdateQua
   useEffect(() => {
     if (!open) {
       setItemPendingRemoval(null)
+      setCheckoutError('')
     }
   }, [open])
 
@@ -32,32 +70,65 @@ function CartSidebar({ open, items, totalItems, totalPrice, onClose, onUpdateQua
       return
     }
 
-    const stillExists = items.some((item) => item.produtoId === itemPendingRemoval.produtoId)
+    const pendingKey = getItemKey(itemPendingRemoval)
+    const stillExists = items.some((item) => getItemKey(item) === pendingKey)
 
     if (!stillExists) {
       setItemPendingRemoval(null)
     }
   }, [itemPendingRemoval, items])
 
-  function handleCheckout() {
-    onClose()
-    navigate('/checkout')
+  async function handleCheckout() {
+    if (checkoutValidating) {
+      return
+    }
+
+    setCheckoutError('')
+    setCheckoutValidating(true)
+
+    try {
+      await validateCartStock({
+        itens: buildCheckoutItemsPayload(items),
+      })
+
+      onClose()
+      navigate('/checkout')
+    } catch (error) {
+      if (isCartStockConflict(error)) {
+        const updatedCart = error?.details?.carrinhoAtualizado
+
+        if (Array.isArray(updatedCart)) {
+          onReplaceItems?.(updatedCart)
+        }
+
+        setCheckoutError(buildCartStockMessage(error))
+        return
+      }
+
+      setCheckoutError(error.message || 'Nao foi possivel validar o estoque. Tente novamente.')
+    } finally {
+      setCheckoutValidating(false)
+    }
   }
 
   function handleDecrease(item) {
+    setCheckoutError('')
+
     if (item.quantidade <= 1) {
       setItemPendingRemoval(item)
       return
     }
 
-    onUpdateQuantity(item.produtoId, item.quantidade - 1)
+    onUpdateQuantity(item.produtoId, item.quantidade - 1, getItemUnitKey(item))
   }
 
   function handleIncrease(item) {
-    onUpdateQuantity(item.produtoId, item.quantidade + 1)
+    setCheckoutError('')
+    onUpdateQuantity(item.produtoId, item.quantidade + 1, getItemUnitKey(item))
   }
 
   function handleAskRemove(item) {
+    setCheckoutError('')
     setItemPendingRemoval(item)
   }
 
@@ -66,7 +137,8 @@ function CartSidebar({ open, items, totalItems, totalPrice, onClose, onUpdateQua
       return
     }
 
-    onRemove(itemPendingRemoval.produtoId)
+    onRemove(itemPendingRemoval.produtoId, getItemUnitKey(itemPendingRemoval))
+    setCheckoutError('')
     setItemPendingRemoval(null)
   }
 
@@ -98,6 +170,11 @@ function CartSidebar({ open, items, totalItems, totalPrice, onClose, onUpdateQua
 
         {items.length === 0 ? (
           <div className="store-sidebar-empty">
+            {checkoutError && (
+              <p className="store-sidebar-checkout-error" role="alert">
+                {checkoutError}
+              </p>
+            )}
             <p>Seu carrinho esta vazio.</p>
             <button type="button" className="store-btn store-btn-secondary" onClick={onClose}>
               Continuar comprando
@@ -107,7 +184,7 @@ function CartSidebar({ open, items, totalItems, totalPrice, onClose, onUpdateQua
           <>
             <ul className="store-sidebar-items">
               {items.map((item) => (
-                <li key={item.produtoId} className="store-sidebar-item">
+                <li key={getItemKey(item)} className="store-sidebar-item">
                   <div className="store-sidebar-item-img">
                     {item.imagem ? (
                       <img src={item.imagem} alt={item.nome} loading="lazy" />
@@ -149,12 +226,23 @@ function CartSidebar({ open, items, totalItems, totalPrice, onClose, onUpdateQua
                 <span>Subtotal</span>
                 <strong>{formatCurrency(totalPrice)}</strong>
               </div>
+              {checkoutError && (
+                <p className="store-sidebar-checkout-error" role="alert">
+                  {checkoutError}
+                </p>
+              )}
               <div className="store-sidebar-actions">
                 <button type="button" className="store-btn store-btn-secondary store-btn-block" onClick={onClose}>
                   Continuar comprando
                 </button>
-                <button type="button" className="store-btn store-btn-primary store-btn-block" onClick={handleCheckout}>
-                  Ir para o checkout
+                <button
+                  type="button"
+                  className="store-btn store-btn-primary store-btn-block"
+                  onClick={handleCheckout}
+                  disabled={checkoutValidating}
+                  aria-busy={checkoutValidating}
+                >
+                  {checkoutValidating ? 'Validando estoque...' : 'Ir para o checkout'}
                 </button>
               </div>
             </div>

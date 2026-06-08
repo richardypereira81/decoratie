@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { formatUppercaseText, normalizeUppercaseText, roundCurrencyValue } from '../../shared/formatters.js'
+import { formatDisplayText, formatUppercaseText, normalizeUppercaseText, roundCurrencyValue } from '../../shared/formatters.js'
 import { getPrimaryProductCategory, normalizeProductCategories } from '../../shared/productCategories.js'
 import { calcularPrecoVenda } from '../services/custoService.js'
 import {
@@ -13,7 +13,7 @@ import {
   normalizeOrigemProdutoValue,
   ORIGEM_PRODUTO_OPTIONS,
 } from '../services/origemProdutoOptions.js'
-import ProductImageSearchModal from './ProductImageSearchModal.jsx'
+import { buildGoogleImagesSearchUrl } from '../services/productImageService.js'
 import Modal from './Modal.jsx'
 import { SearchIcon, UploadIcon } from './AdminIcons.jsx'
 
@@ -43,7 +43,7 @@ const emptyProduct = {
 }
 
 const CREATE_NEW_OPTION = '__create-new__'
-const UPPERCASE_FIELDS = new Set(['nome', 'descricao', 'setor', 'codigoProduto', 'ncm', 'cest'])
+const UPPERCASE_FIELDS = new Set(['nome', 'setor', 'codigoProduto', 'ncm', 'cest'])
 
 function parseOptionalNumber(value) {
   if (value === '' || value === null || value === undefined) {
@@ -68,7 +68,6 @@ export default function ProductModal({ categories = [], open, product, saving, s
   const [imageFile, setImageFile] = useState(null)
   const [preview, setPreview] = useState('')
   const [removeImage, setRemoveImage] = useState(false)
-  const [searchModalOpen, setSearchModalOpen] = useState(false)
   const [selectedSearchImage, setSelectedSearchImage] = useState(null)
   const [categoryDraft, setCategoryDraft] = useState('')
   const [categoryError, setCategoryError] = useState('')
@@ -99,7 +98,7 @@ export default function ProductModal({ categories = [], open, product, saving, s
           altura: product.altura ?? '',
           largura: product.largura ?? '',
           comprimento: product.comprimento ?? '',
-          descricao: normalizeUppercaseText(resolveProductDescription(product)),
+          descricao: formatDisplayText(resolveProductDescription(product)),
           categoria: getPrimaryProductCategory(product),
           setor: normalizeUppercaseText(product.setor),
           codigoProduto: normalizeUppercaseText(product.codigoProduto),
@@ -115,7 +114,6 @@ export default function ProductModal({ categories = [], open, product, saving, s
     setImageFile(null)
     setPreview(nextForm.imagem || '')
     setRemoveImage(false)
-    setSearchModalOpen(false)
     setSelectedSearchImage(null)
     setSectorMode(hasOption(sectorsRef.current, nextForm.setor) || !nextForm.setor ? 'select' : 'custom')
   }, [open, product])
@@ -230,6 +228,11 @@ export default function ProductModal({ categories = [], open, product, saving, s
     })
   }
 
+  function openDirectGoogleImagesSearch() {
+    const query = String(form.nome || form.descricao || '').trim()
+    window.open(buildGoogleImagesSearchUrl(query), '_blank', 'noopener,noreferrer')
+  }
+
   async function handleSubmit(event) {
     event.preventDefault()
     const selectedCategories = normalizeProductCategories(form.categorias, form.categoria)
@@ -242,7 +245,7 @@ export default function ProductModal({ categories = [], open, product, saving, s
     await onSave({
       ...form,
       nome: normalizeUppercaseText(form.nome),
-      descricao: normalizeUppercaseText(resolveProductDescription(form)),
+      descricao: formatDisplayText(resolveProductDescription(form)),
       categoria: selectedCategories[0],
       categorias: selectedCategories,
       setor: normalizeUppercaseText(form.setor),
@@ -268,7 +271,7 @@ export default function ProductModal({ categories = [], open, product, saving, s
   const selectedOrigemOption = getOrigemProdutoOption(form.origemProduto)
   const hasCustomOrigemValue = form.origemProduto && !isKnownOrigemProdutoValue(form.origemProduto)
   const sectorSelectValue = sectorMode === 'custom' ? CREATE_NEW_OPTION : form.setor || ''
-  const suggestedDescription = normalizeUppercaseText(generateSuggestedProductDescription(form))
+  const suggestedDescription = formatDisplayText(generateSuggestedProductDescription(form))
   const selectedCategories = normalizeProductCategories(form.categorias, form.categoria)
   const visibleCategories = useMemo(
     () => listUniqueCategories([...categories, ...selectedCategories]),
@@ -602,7 +605,7 @@ export default function ProductModal({ categories = [], open, product, saving, s
             <button
               type="button"
               className="admin-btn admin-btn-secondary"
-              onClick={() => setSearchModalOpen(true)}
+              onClick={openDirectGoogleImagesSearch}
             >
               <SearchIcon className="admin-inline-icon" />
               <span>Google Imagens</span>
@@ -641,16 +644,6 @@ export default function ProductModal({ categories = [], open, product, saving, s
         </div>
       </form>
 
-      <ProductImageSearchModal
-        initialQuery={form.nome}
-        onClose={() => setSearchModalOpen(false)}
-        onSelectImage={(image) => {
-          setSelectedSearchImage(image)
-          setImageFile(null)
-          setRemoveImage(false)
-        }}
-        open={searchModalOpen}
-      />
     </Modal>
   )
 }

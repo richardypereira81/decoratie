@@ -1,5 +1,7 @@
 import { normalizeUppercaseText } from './formatters.js'
 
+export const UNCATEGORIZED_CATEGORY_FILTER = '__uncategorized'
+
 function getCategoryName(value) {
   if (typeof value === 'string') {
     return value
@@ -47,6 +49,10 @@ export function getPrimaryProductCategory(productOrCategories, fallbackCategory 
 export function productMatchesCategory(product, category) {
   if (!category || category === 'all') {
     return true
+  }
+
+  if (category === UNCATEGORIZED_CATEGORY_FILTER) {
+    return normalizeProductCategories(product).length === 0
   }
 
   return normalizeProductCategories(product).includes(normalizeUppercaseText(category))

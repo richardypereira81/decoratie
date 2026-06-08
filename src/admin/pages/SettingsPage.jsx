@@ -110,6 +110,7 @@ const defaultNotificationForm = {
   email: {
     ativo: false,
     destino: '',
+    remetente: '',
   },
   whatsapp: {
     ativo: false,
@@ -124,6 +125,11 @@ function serviceKey(service) {
 
 function toStringValue(value) {
   return value === null || value === undefined ? '' : String(value)
+}
+
+function buildNotificationEmailFrom(email) {
+  const value = toStringValue(email).trim().toLowerCase()
+  return value ? `Decoratie <${value}>` : ''
 }
 
 function normalizeService(service = {}, index = 0) {
@@ -303,6 +309,7 @@ function notificationConfigToForm(config = {}) {
       ...(config.email || {}),
       ativo: Boolean(config.email?.ativo),
       destino: toStringValue(config.email?.destino),
+      remetente: toStringValue(config.email?.remetente || config.emailFrom),
     },
     whatsapp: {
       ...defaultNotificationForm.whatsapp,
@@ -315,10 +322,13 @@ function notificationConfigToForm(config = {}) {
 }
 
 function notificationFormToPayload(form) {
+  const emailDestino = toStringValue(form.email?.destino).trim().toLowerCase()
+
   return {
     email: {
       ativo: Boolean(form.email?.ativo),
-      destino: toStringValue(form.email?.destino).trim(),
+      destino: emailDestino,
+      remetente: buildNotificationEmailFrom(emailDestino),
     },
     whatsapp: {
       ativo: Boolean(form.whatsapp?.ativo),
@@ -852,6 +862,7 @@ export default function SettingsPage() {
       const whatsappLink = buildWhatsAppUrl(whatsappNumberInput, whatsappMessage)
       const settingsPayload = {
         ...form,
+        googleCseId: toStringValue(form.googleCseId).trim(),
         whatsappLink,
         whatsapp: {
           numero: whatsappDigits,
@@ -1202,6 +1213,20 @@ export default function SettingsPage() {
             </select>
           </label>
 
+          <label className="admin-field">
+            <span>Google CSE ID</span>
+            <input
+              className="admin-input"
+              value={form.googleCseId || ''}
+              onChange={(event) => updateField('googleCseId', event.target.value)}
+              placeholder="ID cx do Google Programmable Search"
+              autoComplete="off"
+            />
+            <small className="admin-field-hint">
+              Usado para buscar imagens de produtos direto no cadastro.
+            </small>
+          </label>
+
           <label className="admin-field admin-field-full">
             <span>Tagline da marca</span>
             <textarea
@@ -1267,6 +1292,9 @@ export default function SettingsPage() {
               placeholder="pedidos@decoratie.com.br"
               autoComplete="off"
             />
+            <small className="admin-field-hint">
+              Ao salvar, este e-mail tambem sera usado como remetente: {buildNotificationEmailFrom(notificationForm.email?.destino) || '--'}.
+            </small>
           </label>
 
           <label className="admin-toggle">

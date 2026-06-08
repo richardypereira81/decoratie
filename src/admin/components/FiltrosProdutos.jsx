@@ -1,5 +1,6 @@
 import { ChevronDownIcon, CloseIcon, FilterIcon } from './AdminIcons.jsx'
 import ToolbarDropdown from './ToolbarDropdown.jsx'
+import { UNCATEGORIZED_CATEGORY_FILTER } from '../../shared/productCategories.js'
 
 function joinClassNames(...values) {
   return values.filter(Boolean).join(' ')
@@ -122,34 +123,97 @@ export default function FiltrosProdutos({
           </div>
         </section>
 
-        {categories.length ? (
-          <section className="admin-filter-section">
-            <div className="admin-filter-section-head">
-              <strong>Categoria</strong>
-              <span>Classificacao</span>
-            </div>
+        <section className="admin-filter-section">
+          <div className="admin-filter-section-head">
+            <strong>Categoria</strong>
+            <span>Classificacao</span>
+          </div>
 
-            <div className="admin-filter-options">
+          <div className="admin-filter-options">
+            <button
+              type="button"
+              className={joinClassNames('admin-filter-chip', filters.category === 'all' ? 'is-selected' : '')}
+              onClick={() => updateField('category', 'all')}
+            >
+              <span>Todas</span>
+            </button>
+            <button
+              type="button"
+              className={joinClassNames(
+                'admin-filter-chip',
+                filters.category === UNCATEGORIZED_CATEGORY_FILTER ? 'is-selected' : '',
+              )}
+              onClick={() => updateField('category', UNCATEGORIZED_CATEGORY_FILTER)}
+            >
+              <span>Sem categoria</span>
+            </button>
+            {categories.map((category) => (
               <button
+                key={category}
                 type="button"
-                className={joinClassNames('admin-filter-chip', filters.category === 'all' ? 'is-selected' : '')}
-                onClick={() => updateField('category', 'all')}
+                className={joinClassNames('admin-filter-chip', filters.category === category ? 'is-selected' : '')}
+                onClick={() => updateField('category', category)}
               >
-                <span>Todas</span>
+                <span>{category}</span>
               </button>
-              {categories.map((category) => (
-                <button
-                  key={category}
-                  type="button"
-                  className={joinClassNames('admin-filter-chip', filters.category === category ? 'is-selected' : '')}
-                  onClick={() => updateField('category', category)}
-                >
-                  <span>{category}</span>
-                </button>
-              ))}
-            </div>
-          </section>
-        ) : null}
+            ))}
+          </div>
+        </section>
+
+        <section className="admin-filter-section">
+          <div className="admin-filter-section-head">
+            <strong>Imagem</strong>
+            <span>Foto do produto</span>
+          </div>
+
+          <div className="admin-filter-options">
+            <button
+              type="button"
+              className={joinClassNames('admin-filter-chip', filters.photo === 'all' ? 'is-selected' : '')}
+              onClick={() => updateField('photo', 'all')}
+            >
+              <span>Todos</span>
+            </button>
+            <button
+              type="button"
+              className={joinClassNames('admin-filter-chip', filters.photo === 'with_photo' ? 'is-selected' : '')}
+              onClick={() => updateField('photo', 'with_photo')}
+            >
+              <span>Com foto</span>
+            </button>
+            <button
+              type="button"
+              className={joinClassNames('admin-filter-chip', filters.photo === 'without_photo' ? 'is-selected' : '')}
+              onClick={() => updateField('photo', 'without_photo')}
+            >
+              <span>Sem foto</span>
+            </button>
+          </div>
+        </section>
+
+        <section className="admin-filter-section">
+          <div className="admin-filter-section-head">
+            <strong>Margem</strong>
+            <span>Preco de venda</span>
+          </div>
+
+          <div className="admin-filter-options">
+            <button
+              type="button"
+              className={joinClassNames('admin-filter-chip', filters.margin === 'all' ? 'is-selected' : '')}
+              onClick={() => updateField('margin', 'all')}
+            >
+              <span>Todos</span>
+            </button>
+            <button
+              type="button"
+              className={joinClassNames('admin-filter-chip', filters.margin === 'below_100' ? 'is-selected' : '')}
+              onClick={() => updateField('margin', 'below_100')}
+            >
+              <span>Abaixo de 100%</span>
+            </button>
+          </div>
+        </section>
 
         {sectors.length ? (
           <section className="admin-filter-section">

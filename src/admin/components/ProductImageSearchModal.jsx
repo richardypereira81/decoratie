@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
+import { defaultSettings } from '../../data/siteDefaults.js'
 import { CheckIcon, DownloadIcon, SearchIcon } from './AdminIcons.jsx'
 import Modal from './Modal.jsx'
 import {
+  buildGoogleImagesSearchUrl,
   buildRemoteImageDownloadUrl,
   ensureGoogleImageSearchLoaded,
   executeGoogleImageSearch,
@@ -9,13 +11,39 @@ import {
   renderGoogleImageSearch,
   subscribeGoogleImageResults,
 } from '../services/productImageService.js'
+import { useDocumentData } from '../hooks/useFirestoreData.js'
 
 function normalizeGoogleImageResults(results) {
   const uniqueResults = new Map()
 
   ;(Array.isArray(results) ? results : []).forEach((result, index) => {
-    const imageUrl = result?.image?.url || result?.url || ''
-    const thumbnailUrl = result?.thumbnailImage?.url || result?.image?.url || result?.url || ''
+    const richSnippet = result?.richSnippet || result?.richsnippet || {}
+    const pageMap = result?.pagemap || {}
+    const pageMapImage = Array.isArray(pageMap.cse_image) ? pageMap.cse_image[0] : null
+    const pageMapThumbnail = Array.isArray(pageMap.cse_thumbnail) ? pageMap.cse_thumbnail[0] : null
+    const imageUrl =
+      result?.image?.url ||
+      result?.image?.src ||
+      result?.image?.thumbnailLink ||
+      result?.url ||
+      result?.unescapedUrl ||
+      result?.originalUrl ||
+      result?.contentUrl ||
+      result?.mediaUrl ||
+      richSnippet?.cseImage?.src ||
+      richSnippet?.cse_image?.src ||
+      pageMapImage?.src ||
+      ''
+    const thumbnailUrl =
+      result?.thumbnailImage?.url ||
+      result?.thumbnailUrl ||
+      result?.thumbnail ||
+      result?.tbUrl ||
+      result?.image?.thumbnailLink ||
+      richSnippet?.cseThumbnail?.src ||
+      richSnippet?.cse_thumbnail?.src ||
+      pageMapThumbnail?.src ||
+      imageUrl
 
     if (!imageUrl && !thumbnailUrl) {
       return
@@ -27,12 +55,12 @@ function normalizeGoogleImageResults(results) {
       uniqueResults.set(key, {
         id: key,
         contextUrl: result?.contextUrl || '',
-        height: result?.image?.height || result?.thumbnailImage?.height || null,
+        height: result?.image?.height || result?.thumbnailImage?.height || result?.height || pageMapThumbnail?.height || null,
         imageUrl,
         thumbnailUrl,
         title: result?.titleNoFormatting || result?.title || 'Imagem encontrada',
-        visibleUrl: result?.visibleUrl || '',
-        width: result?.image?.width || result?.thumbnailImage?.width || null,
+        visibleUrl: result?.visibleUrl || result?.displayLink || '',
+        width: result?.image?.width || result?.thumbnailImage?.width || result?.width || pageMapThumbnail?.width || null,
       })
     }
   })
@@ -48,8 +76,13 @@ function formatDimensions(result) {
   return `${result.width} x ${result.height}`
 }
 
+function openGoogleImagesSearch(query) {
+  window.open(buildGoogleImagesSearchUrl(query), '_blank', 'noopener,noreferrer')
+}
+
 export default function ProductImageSearchModal({ initialQuery = '', onClose, onSelectImage, open }) {
-  const { cseId, enabled } = getGoogleImageSearchConfig()
+  const { data: settings } = useDocumentData('configuracoes', 'geral', defaultSettings)
+  const { cseId, enabled } = getGoogleImageSearchConfig(settings.googleCseId)
   const [query, setQuery] = useState(initialQuery)
   const [results, setResults] = useState([])
   const [loading, setLoading] = useState(false)
@@ -58,6 +91,25 @@ export default function ProductImageSearchModal({ initialQuery = '', onClose, on
   const renderHostRef = useRef(null)
   const gnameRef = useRef(`produto-imagem-${Math.random().toString(36).slice(2, 10)}`)
   const didAutoSearchRef = useRef(false)
+  const searchTimeoutRef = useRef(null)
+
+  function clearSearchTimeout() {
+    if (searchTimeoutRef.current) {
+      window.clearTimeout(searchTimeoutRef.current)
+      searchTimeoutRef.current = null
+    }
+  }
+
+  function startSearch(trimmedQuery) {
+    clearSearchTimeout()
+    setLoading(true)
+    setError('')
+    executeGoogleImageSearch(gnameRef.current, trimmedQuery)
+    searchTimeoutRef.current = window.setTimeout(() => {
+      setLoading(false)
+      setError('A busca integrada demorou para retornar. Tente abrir a busca direta no Google Imagens.')
+    }, 8000)
+  }
 
   useEffect(() => {
     if (!open) {
@@ -66,6 +118,7 @@ export default function ProductImageSearchModal({ initialQuery = '', onClose, on
       setError('')
       setSearchReady(false)
       didAutoSearchRef.current = false
+      clearSearchTimeout()
       return
     }
 
@@ -81,7 +134,7 @@ export default function ProductImageSearchModal({ initialQuery = '', onClose, on
     let unsubscribe = () => {}
     setSearchReady(false)
 
-    ensureGoogleImageSearchLoaded()
+    ensureGoogleImageSearchLoaded(cseId)
       .then(() => {
         if (!active) {
           return
@@ -89,12 +142,20 @@ export default function ProductImageSearchModal({ initialQuery = '', onClose, on
 
         unsubscribe = subscribeGoogleImageResults(gnameRef.current, ({ results: nextResults }) => {
           if (!active) {
-            return
+            return false
           }
 
-          setResults(normalizeGoogleImageResults(nextResults))
+          clearSearchTimeout()
+          const nextNormalizedResults = normalizeGoogleImageResults(nextResults)
+          setResults(nextNormalizedResults)
           setLoading(false)
-          setError('')
+          setError(
+            nextNormalizedResults.length
+              ? ''
+              : 'Nao consegui montar os cards dessa busca. Veja os resultados do Google abaixo ou abra a busca direta.',
+          )
+
+          return nextNormalizedResults.length > 0
         })
 
         renderGoogleImageSearch(renderHostRef.current, gnameRef.current)
@@ -111,6 +172,7 @@ export default function ProductImageSearchModal({ initialQuery = '', onClose, on
 
     return () => {
       active = false
+      clearSearchTimeout()
       unsubscribe()
       setSearchReady(false)
 
@@ -118,7 +180,7 @@ export default function ProductImageSearchModal({ initialQuery = '', onClose, on
         renderHostRef.current.innerHTML = ''
       }
     }
-  }, [enabled, open])
+  }, [cseId, enabled, open])
 
   useEffect(() => {
     if (!open || !enabled || !searchReady || didAutoSearchRef.current) {
@@ -133,10 +195,9 @@ export default function ProductImageSearchModal({ initialQuery = '', onClose, on
 
     didAutoSearchRef.current = true
     try {
-      setLoading(true)
-      setError('')
-      executeGoogleImageSearch(gnameRef.current, trimmedQuery)
+      startSearch(trimmedQuery)
     } catch (searchError) {
+      clearSearchTimeout()
       setLoading(false)
       setError(searchError.message || 'Nao foi possivel iniciar a busca.')
     }
@@ -152,11 +213,16 @@ export default function ProductImageSearchModal({ initialQuery = '', onClose, on
       return
     }
 
-    try {
-      setLoading(true)
+    if (!enabled) {
       setError('')
-      executeGoogleImageSearch(gnameRef.current, trimmedQuery)
+      openGoogleImagesSearch(trimmedQuery)
+      return
+    }
+
+    try {
+      startSearch(trimmedQuery)
     } catch (searchError) {
+      clearSearchTimeout()
       setLoading(false)
       setError(searchError.message || 'Nao foi possivel iniciar a busca.')
     }
@@ -189,14 +255,14 @@ export default function ProductImageSearchModal({ initialQuery = '', onClose, on
             />
           </label>
 
-          <button type="submit" className="admin-btn" disabled={!enabled || !searchReady || loading}>
-            {loading ? 'Buscando...' : 'Buscar imagens'}
+          <button type="submit" className="admin-btn" disabled={(enabled && !searchReady) || loading}>
+            {loading ? 'Buscando...' : enabled ? 'Buscar imagens' : 'Abrir Google Imagens'}
           </button>
         </form>
 
         {!enabled ? (
-          <div className="admin-inline-notice is-danger">
-            {`Configure VITE_GOOGLE_CSE_ID para ativar a busca integrada no Google Imagens. CSE atual: ${cseId || 'nao configurado'}.`}
+          <div className="admin-inline-notice">
+            {`Busca integrada nao configurada. Defina o Google CSE ID em Configuracoes ou VITE_GOOGLE_CSE_ID para ver resultados aqui; CSE atual: ${cseId || 'nao configurado'}.`}
           </div>
         ) : null}
 
@@ -204,7 +270,19 @@ export default function ProductImageSearchModal({ initialQuery = '', onClose, on
         {!error && enabled && !searchReady ? <div className="admin-inline-notice">Preparando a busca do Google Imagens...</div> : null}
         {loading ? <div className="admin-inline-notice">Buscando imagens relacionadas ao produto...</div> : null}
 
-        <div ref={renderHostRef} className="sr-only" aria-hidden="true" />
+        {enabled && String(query || initialQuery || '').trim() ? (
+          <div className="admin-inline-actions">
+            <button
+              type="button"
+              className="admin-btn-secondary"
+              onClick={() => openGoogleImagesSearch(String(query || initialQuery).trim())}
+            >
+              Abrir busca direta no Google Imagens
+            </button>
+          </div>
+        ) : null}
+
+        <div ref={renderHostRef} className="admin-google-cse-host" />
 
         {results.length ? (
           <div className="admin-image-search-grid">

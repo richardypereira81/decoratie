@@ -21,6 +21,13 @@ const PAYMENT_ERROR_MESSAGES = {
   pedido_nao_encontrado: 'Pedido nao encontrado.',
   pedido_sem_itens: 'Pedido sem itens para pagamento.',
   pedido_total_divergente: 'O total do pedido foi atualizado. Revise antes de pagar.',
+  pedido_cupom_indisponivel: 'O cupom aplicado nao esta mais disponivel. Remova ou escolha outro cupom para continuar.',
+  cupom_codigo_invalido: 'O cupom aplicado nao esta mais disponivel. Remova ou escolha outro cupom para continuar.',
+  cupom_nao_encontrado: 'O cupom aplicado nao esta mais disponivel. Remova ou escolha outro cupom para continuar.',
+  cupom_indisponivel: 'O cupom aplicado nao esta mais disponivel. Remova ou escolha outro cupom para continuar.',
+  cupom_expirado: 'O cupom aplicado nao esta mais disponivel. Remova ou escolha outro cupom para continuar.',
+  cupom_nao_iniciado: 'O cupom aplicado nao esta mais disponivel. Remova ou escolha outro cupom para continuar.',
+  cupom_percentual_invalido: 'O cupom aplicado nao esta mais disponivel. Remova ou escolha outro cupom para continuar.',
 }
 
 function createPaymentError(message, { code = 'pagamento_erro', details = null } = {}) {
